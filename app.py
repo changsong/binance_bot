@@ -41,8 +41,6 @@ else:
     BASE_URL = None  # mainnet 默认
 
 logger.info(f"🚀 BOT STARTED | MODE={BINANCE_MODE}")
-logger.info(f"🔌 API connection successful | API_SECRET: {API_KEY}")
-logger.info(f"🔌 API connection successful | API_SECRET: {API_SECRET}")
 
 # ========== Trading ==========
 SYMBOL = "BTCUSDT"
