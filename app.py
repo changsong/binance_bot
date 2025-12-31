@@ -9,6 +9,22 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# ================= 日志 =================
+logger = logging.getLogger("binance_bot")
+logger.setLevel(logging.INFO)
+
+handler = RotatingFileHandler(
+    "./logs/app.log",
+    maxBytes=50 * 1024 * 1024,
+    backupCount=5
+)
+formatter = logging.Formatter(
+    "%(asctime)s | %(levelname)s | %(message)s"
+)
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+
+
 # ========== MODE ==========
 BINANCE_MODE = os.getenv("BINANCE_MODE", "testnet").lower()
 if BINANCE_MODE not in ("testnet", "main"):
@@ -23,6 +39,10 @@ else:
     API_KEY = os.getenv("BINANCE_MAIN_API_KEY")
     API_SECRET = os.getenv("BINANCE_MAIN_API_SECRET")
     BASE_URL = None  # mainnet 默认
+
+logger.info(f"🚀 BOT STARTED | MODE={BINANCE_MODE}")
+logger.info(f"🔌 API connection successful | API_SECRET: {API_KEY}")
+logger.info(f"🔌 API connection successful | API_SECRET: {API_SECRET}")
 
 # ========== Trading ==========
 SYMBOL = "BTCUSDT"
@@ -52,21 +72,6 @@ for k, v in {
 
 if missing:
     raise RuntimeError(f"Missing ENV vars: {missing}")
-
-# ================= 日志 =================
-logger = logging.getLogger("binance_bot")
-logger.setLevel(logging.INFO)
-
-handler = RotatingFileHandler(
-    "./logs/app.log",
-    maxBytes=5 * 1024 * 1024,
-    backupCount=5
-)
-formatter = logging.Formatter(
-    "%(asctime)s | %(levelname)s | %(message)s"
-)
-handler.setFormatter(formatter)
-logger.addHandler(handler)
 
 # ================= Flask =================
 app = Flask(__name__)
