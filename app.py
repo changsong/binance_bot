@@ -34,6 +34,7 @@ SYMBOL = "BTCUSDT"
 LEVERAGE = int(os.getenv("LEVERAGE", 3))
 RISK_PCT = float(os.getenv("RISK_PCT", 0.01))
 QTY_PRECISION = int(os.getenv("QTY_PRECISION", 3))
+SKIP_LEVERAGE_SETUP = os.getenv("SKIP_LEVERAGE_SETUP", "false").lower() == "true"
 
 # ========== 交易历史文件 ==========
 TRADE_HISTORY_FILE = "./logs/trade_history.json"
@@ -185,28 +186,40 @@ def test_api_connection_with_retry(max_retries: int = 3) -> bool:
 # 测试 API 连接（带重试）
 test_api_connection_with_retry()
 
-# 尝试设置杠杆（延迟执行，避免速率限制）
-time.sleep(1)  # 等待 1 秒，避免连续请求
-try:
-    client.change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
-    logger.info(f"✅ Leverage set to {LEVERAGE}x for {SYMBOL}")
-except ClientError as e:
-    retry_after = handle_rate_limit_error(e)
-    if retry_after:
-        logger.warning(f"⚠️ Rate limit hit when setting leverage, will retry after {retry_after} seconds")
-        time.sleep(retry_after)
-        try:
-            client.change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
-            logger.info(f"✅ Leverage set to {LEVERAGE}x for {SYMBOL} (after retry)")
-        except Exception as retry_e:
-            logger.warning(f"⚠️ Failed to set leverage after retry: {retry_e}")
-    else:
-        logger.warning(f"⚠️ Failed to set leverage (ClientError): {e}")
-        logger.warning("⚠️ Possible reasons: API key lacks permission, IP not whitelisted, or leverage already set")
-except ServerError as e:
-    logger.warning(f"⚠️ Failed to set leverage (ServerError): {e}")
-except Exception as e:
-    logger.warning(f"⚠️ Failed to set leverage (Unknown): {e}")
+# 尝试设置杠杆（如果未跳过）
+if not SKIP_LEVERAGE_SETUP:
+    time.sleep(1)  # 等待 1 秒，避免连续请求
+    try:
+        client.change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
+        logger.info(f"✅ Leverage set to {LEVERAGE}x for {SYMBOL}")
+    except ClientError as e:
+        # 检查是否是权限错误（401）
+        if e.status_code == 401 or (hasattr(e, 'error_code') and e.error_code == -2015):
+            logger.warning(f"⚠️ Failed to set leverage: API key lacks permission (401)")
+            logger.warning("⚠️ This is usually because:")
+            logger.warning("   1. API key doesn't have 'Enable Futures' permission")
+            logger.warning("   2. IP address is not whitelisted")
+            logger.warning("   3. Leverage may already be set correctly")
+            logger.warning("⚠️ Application will continue, leverage may need to be set manually")
+        else:
+            # 检查是否是速率限制错误
+            retry_after = handle_rate_limit_error(e)
+            if retry_after:
+                logger.warning(f"⚠️ Rate limit hit when setting leverage, will retry after {retry_after} seconds")
+                time.sleep(retry_after)
+                try:
+                    client.change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
+                    logger.info(f"✅ Leverage set to {LEVERAGE}x for {SYMBOL} (after retry)")
+                except Exception as retry_e:
+                    logger.warning(f"⚠️ Failed to set leverage after retry: {retry_e}")
+            else:
+                logger.warning(f"⚠️ Failed to set leverage (ClientError): {e}")
+    except ServerError as e:
+        logger.warning(f"⚠️ Failed to set leverage (ServerError): {e}")
+    except Exception as e:
+        logger.warning(f"⚠️ Failed to set leverage (Unknown): {e}")
+else:
+    logger.info(f"⏭️ Skipping leverage setup (SKIP_LEVERAGE_SETUP=true)")
 
 logger.info(f"🚀 BOT STARTED | MODE={BINANCE_MODE} | SYMBOL={SYMBOL} | LEVERAGE={LEVERAGE}x")
 
