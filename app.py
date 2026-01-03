@@ -1,30 +1,18 @@
 import os
-import time
+import json
 import logging
 import requests
+from datetime import datetime
+from typing import Dict, Optional, Tuple, Any
 from logging.handlers import RotatingFileHandler
 from flask import Flask, request, jsonify
 from binance.um_futures import UMFutures
+from binance.error import ClientError, ServerError
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# ================= 日志 =================
-logger = logging.getLogger("binance_bot")
-logger.setLevel(logging.INFO)
-
-handler = RotatingFileHandler(
-    "./logs/app.log",
-    maxBytes=50 * 1024 * 1024,
-    backupCount=5
-)
-formatter = logging.Formatter(
-    "%(asctime)s | %(levelname)s | %(message)s"
-)
-handler.setFormatter(formatter)
-logger.addHandler(handler)
-
-
+# ================= 配置加载 =================
 # ========== MODE ==========
 BINANCE_MODE = os.getenv("BINANCE_MODE", "testnet").lower()
 if BINANCE_MODE not in ("testnet", "main"):
@@ -38,15 +26,16 @@ if BINANCE_MODE == "testnet":
 else:
     API_KEY = os.getenv("BINANCE_MAIN_API_KEY")
     API_SECRET = os.getenv("BINANCE_MAIN_API_SECRET")
-    BASE_URL = None  # mainnet 默认
-
-logger.info(f"🚀 BOT STARTED | MODE={BINANCE_MODE}")
+    BASE_URL = "https://fapi.binance.com"
 
 # ========== Trading ==========
 SYMBOL = "BTCUSDT"
-LEVERAGE = 3
-RISK_PCT = 0.01
-QTY_PRECISION = 3
+LEVERAGE = int(os.getenv("LEVERAGE", 3))
+RISK_PCT = float(os.getenv("RISK_PCT", 0.01))
+QTY_PRECISION = int(os.getenv("QTY_PRECISION", 3))
+
+# ========== 交易历史文件 ==========
+TRADE_HISTORY_FILE = "./logs/trade_history.json"
 
 # ========== Security ==========
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
@@ -58,7 +47,7 @@ FEISHU_WEBHOOK = os.getenv("FEISHU_WEBHOOK")
 HOST = "0.0.0.0"
 PORT = int(os.getenv("PORT", 80))
 
-# ========== Check ==========
+# ========== 配置验证 ==========
 missing = []
 for k, v in {
     "API_KEY": API_KEY,
@@ -71,22 +60,87 @@ for k, v in {
 if missing:
     raise RuntimeError(f"Missing ENV vars: {missing}")
 
+# 验证配置合理性
+if RISK_PCT <= 0 or RISK_PCT > 1:
+    raise RuntimeError(f"RISK_PCT must be between 0 and 1, got {RISK_PCT}")
+
+if LEVERAGE < 1 or LEVERAGE > 125:
+    raise RuntimeError(f"LEVERAGE must be between 1 and 125, got {LEVERAGE}")
+
+if QTY_PRECISION < 0 or QTY_PRECISION > 8:
+    raise RuntimeError(f"QTY_PRECISION must be between 0 and 8, got {QTY_PRECISION}")
+
+# ================= 日志初始化 =================
+logger = logging.getLogger("binance_bot")
+logger.setLevel(logging.INFO)
+
+# 确保日志目录存在
+os.makedirs("./logs", exist_ok=True)
+
+handler = RotatingFileHandler(
+    "./logs/app.log",
+    maxBytes=50 * 1024 * 1024,
+    backupCount=5
+)
+formatter = logging.Formatter(
+    "%(asctime)s | %(levelname)s | %(message)s"
+)
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+
+# 同时输出到控制台
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
+
 # ================= Flask =================
 app = Flask(__name__)
 
-# ================= Binance =================
+# ================= Binance 客户端初始化 =================
 client = UMFutures(
     key=API_KEY,
     secret=API_SECRET,
     base_url=BASE_URL
 )
 
-client.change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
+# 测试 API 连接
+try:
+    account_info = client.account()
+    logger.info(f"✅ API connection successful | Mode: {BINANCE_MODE}")
+except ClientError as e:
+    logger.error(f"❌ API connection failed (ClientError): {e}")
+    logger.error("❌ Please check your API_KEY, API_SECRET, and IP whitelist settings")
+    raise
+except ServerError as e:
+    logger.error(f"❌ API connection failed (ServerError): {e}")
+    logger.error("❌ Binance server error, please try again later")
+    raise
+except Exception as e:
+    logger.error(f"❌ API connection failed (Unknown): {e}")
+    raise
 
-logger.info(f"🚀 BOT STARTED | MODE={BINANCE_MODE}")
+# 尝试设置杠杆
+try:
+    client.change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
+    logger.info(f"✅ Leverage set to {LEVERAGE}x for {SYMBOL}")
+except ClientError as e:
+    logger.warning(f"⚠️ Failed to set leverage (ClientError): {e}")
+    logger.warning("⚠️ Possible reasons: API key lacks permission, IP not whitelisted, or leverage already set")
+except ServerError as e:
+    logger.warning(f"⚠️ Failed to set leverage (ServerError): {e}")
+except Exception as e:
+    logger.warning(f"⚠️ Failed to set leverage (Unknown): {e}")
+
+logger.info(f"🚀 BOT STARTED | MODE={BINANCE_MODE} | SYMBOL={SYMBOL} | LEVERAGE={LEVERAGE}x")
 
 # ================= Feishu =================
-def feishu_notify(msg: str):
+def feishu_notify(msg: str) -> None:
+    """
+    发送飞书通知
+    
+    Args:
+        msg: 要发送的消息内容
+    """
     if not FEISHU_WEBHOOK:
         return
     try:
@@ -98,86 +152,400 @@ def feishu_notify(msg: str):
     except Exception as e:
         logger.error(f"Feishu error: {e}")
 
+# ================= 交易历史记录 =================
+def save_trade_history(side: str, qty: float, entry: float, stop: float, order_id: Optional[int] = None) -> None:
+    """
+    保存交易记录到文件
+    
+    Args:
+        side: 交易方向 (LONG/SHORT)
+        qty: 交易数量
+        entry: 入场价格
+        stop: 止损价格
+        order_id: 订单ID（可选）
+    """
+    try:
+        trade_record = {
+            "timestamp": datetime.now().isoformat(),
+            "side": side,
+            "qty": qty,
+            "entry": entry,
+            "stop": stop,
+            "order_id": order_id,
+            "symbol": SYMBOL,
+            "mode": BINANCE_MODE
+        }
+        
+        # 读取现有历史记录
+        history = []
+        if os.path.exists(TRADE_HISTORY_FILE):
+            try:
+                with open(TRADE_HISTORY_FILE, "r", encoding="utf-8") as f:
+                    history = json.load(f)
+            except Exception as e:
+                logger.warning(f"Failed to read trade history: {e}")
+        
+        # 添加新记录
+        history.append(trade_record)
+        
+        # 只保留最近1000条记录
+        if len(history) > 1000:
+            history = history[-1000:]
+        
+        # 保存到文件
+        os.makedirs(os.path.dirname(TRADE_HISTORY_FILE), exist_ok=True)
+        with open(TRADE_HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(history, f, indent=2, ensure_ascii=False)
+        
+        logger.info(f"Trade history saved: {trade_record}")
+    except Exception as e:
+        logger.error(f"Failed to save trade history: {e}")
+
+def get_trade_history(limit: int = 50) -> list:
+    """
+    获取交易历史记录
+    
+    Args:
+        limit: 返回的记录数量限制
+        
+    Returns:
+        交易历史记录列表
+    """
+    try:
+        if not os.path.exists(TRADE_HISTORY_FILE):
+            return []
+        
+        with open(TRADE_HISTORY_FILE, "r", encoding="utf-8") as f:
+            history = json.load(f)
+        
+        # 返回最近的记录
+        return history[-limit:] if limit > 0 else history
+    except Exception as e:
+        logger.error(f"Failed to get trade history: {e}")
+        return []
+
 # ================= Utils =================
-def get_balance():
-    for b in client.balance():
-        if b["asset"] == "USDT":
-            return float(b["balance"])
-    return 0.0
+def get_balance() -> float:
+    """
+    获取 USDT 余额
+    
+    Returns:
+        USDT 余额，如果获取失败则抛出异常
+    """
+    try:
+        balances = client.balance()
+        for b in balances:
+            if b["asset"] == "USDT":
+                return float(b["balance"])
+        logger.warning("USDT balance not found")
+        return 0.0
+    except ClientError as e:
+        logger.error(f"Failed to get balance (ClientError): {e}")
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get balance (Unknown): {e}")
+        raise
 
-def get_position_qty():
-    p = client.get_position_risk(symbol=SYMBOL)[0]
-    return float(p["positionAmt"])
+def get_position_qty() -> float:
+    """
+    获取当前持仓数量
+    
+    Returns:
+        持仓数量，正数表示多仓，负数表示空仓，0 表示无持仓
+    """
+    try:
+        positions = client.get_position_risk(symbol=SYMBOL)
+        if not positions:
+            return 0.0
+        return float(positions[0]["positionAmt"])
+    except ClientError as e:
+        logger.error(f"Failed to get position (ClientError): {e}")
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get position (Unknown): {e}")
+        raise
 
-def calc_qty(entry, stop):
-    bal = get_balance()
-    risk = bal * RISK_PCT
+def calc_qty(entry: float, stop: float) -> float:
+    """
+    根据入场价和止损价计算交易数量
+    
+    Args:
+        entry: 入场价格
+        stop: 止损价格
+        
+    Returns:
+        计算出的交易数量，如果计算失败返回 0
+    """
+    if entry <= 0 or stop <= 0:
+        logger.error(f"Invalid entry/stop: entry={entry}, stop={stop}")
+        return 0.0
+    
     dist = abs(entry - stop)
     if dist <= 0:
-        return 0
-    return round(risk / dist, QTY_PRECISION)
+        logger.error(f"Entry and stop are too close: entry={entry}, stop={stop}")
+        return 0.0
+    
+    try:
+        bal = get_balance()
+        if bal <= 0:
+            logger.error(f"Insufficient balance: {bal}")
+            return 0.0
+        
+        risk = bal * RISK_PCT
+        qty = round(risk / dist, QTY_PRECISION)
+        logger.info(f"Calculated qty: balance={bal}, risk={risk}, dist={dist}, qty={qty}")
+        return qty
+    except Exception as e:
+        logger.error(f"Failed to calculate qty: {e}")
+        return 0.0
 
-def close_if_reverse(side, pos_qty):
+def close_if_reverse(side: str, pos_qty: float) -> None:
+    """
+    如果当前持仓方向与交易方向相反，先平仓
+    
+    Args:
+        side: 交易方向 (LONG/SHORT)
+        pos_qty: 当前持仓数量
+    """
     if side == "LONG" and pos_qty < 0:
+        logger.info(f"Closing reverse position: side={side}, pos_qty={pos_qty}")
         _close(abs(pos_qty))
     elif side == "SHORT" and pos_qty > 0:
+        logger.info(f"Closing reverse position: side={side}, pos_qty={pos_qty}")
         _close(abs(pos_qty))
 
-def _close(qty):
-    client.new_order(
-        symbol=SYMBOL,
-        side="BUY" if qty < 0 else "SELL",
-        type="MARKET",
-        quantity=abs(qty),
-        reduceOnly=True
-    )
-    logger.info(f"Position closed qty={qty}")
+def _close(qty: float) -> None:
+    """
+    执行平仓操作
+    
+    Args:
+        qty: 要平仓的数量（正数）
+    """
+    if qty <= 0:
+        logger.warning(f"Invalid close qty: {qty}")
+        return
+    
+    try:
+        side = "BUY" if qty < 0 else "SELL"
+        result = client.new_order(
+            symbol=SYMBOL,
+            side=side,
+            type="MARKET",
+            quantity=abs(qty),
+            reduceOnly=True
+        )
+        logger.info(f"Position closed: qty={qty}, side={side}, order_id={result.get('orderId')}")
+    except ClientError as e:
+        logger.error(f"Failed to close position (ClientError): {e}")
+        raise
+    except Exception as e:
+        logger.error(f"Failed to close position (Unknown): {e}")
+        raise
 
 # ================= Webhook =================
 @app.route("/webhook", methods=["POST"])
-def webhook():
-    data = request.get_json(force=True, silent=True)
-    logger.info(f"Webhook: {data}")
+def webhook() -> Tuple[Dict[str, Any], int]:
+    """
+    处理交易 webhook 请求
+    
+    Returns:
+        JSON 响应和 HTTP 状态码
+    """
+    try:
+        data = request.get_json(force=True, silent=True)
+        
+        # 记录请求（脱敏处理）
+        log_data = {k: v for k, v in data.items() if k != "secret"} if data else None
+        logger.info(f"Webhook received: {log_data}")
 
-    if not data:
-        return jsonify({"error": "invalid json"}), 400
+        # 验证 JSON
+        if not data:
+            logger.warning("Invalid JSON in webhook request")
+            return jsonify({"error": "invalid json"}), 400
 
-    if data.get("secret") != WEBHOOK_SECRET:
-        return jsonify({"error": "unauthorized"}), 403
+        # 验证密钥
+        if data.get("secret") != WEBHOOK_SECRET:
+            logger.warning("Unauthorized webhook request")
+            return jsonify({"error": "unauthorized"}), 403
 
-    side = data.get("side")
-    entry = float(data.get("entry", 0))
-    stop = float(data.get("stop", 0))
+        # 验证和解析参数
+        side = data.get("side", "").upper()
+        if side not in ("LONG", "SHORT"):
+            logger.warning(f"Invalid side: {side}")
+            return jsonify({"error": "invalid side, must be LONG or SHORT"}), 400
 
-    if side not in ("LONG", "SHORT"):
-        return jsonify({"error": "invalid side"}), 400
+        try:
+            entry = float(data.get("entry", 0))
+            stop = float(data.get("stop", 0))
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Invalid entry/stop values: {e}")
+            return jsonify({"error": "invalid entry or stop value"}), 400
 
-    qty = calc_qty(entry, stop)
-    if qty <= 0:
-        return jsonify({"error": "qty too small"}), 400
+        # 验证价格参数
+        if entry <= 0 or stop <= 0:
+            logger.warning(f"Invalid price values: entry={entry}, stop={stop}")
+            return jsonify({"error": "entry and stop must be positive"}), 400
 
-    pos_qty = get_position_qty()
-    close_if_reverse(side, pos_qty)
+        if abs(entry - stop) <= 0:
+            logger.warning(f"Entry and stop are too close: entry={entry}, stop={stop}")
+            return jsonify({"error": "entry and stop must be different"}), 400
 
-    if side == "LONG" and pos_qty > 0:
-        return jsonify({"status": "skip"})
-    if side == "SHORT" and pos_qty < 0:
-        return jsonify({"status": "skip"})
+        # 计算交易数量
+        qty = calc_qty(entry, stop)
+        if qty <= 0:
+            logger.warning(f"Calculated qty too small: qty={qty}, entry={entry}, stop={stop}")
+            return jsonify({"error": "qty too small, check balance and risk settings"}), 400
 
-    client.new_order(
-        symbol=SYMBOL,
-        side="BUY" if side == "LONG" else "SELL",
-        type="MARKET",
-        quantity=qty
-    )
+        # 获取当前持仓
+        try:
+            pos_qty = get_position_qty()
+        except Exception as e:
+            logger.error(f"Failed to get position: {e}")
+            return jsonify({"error": "failed to get position"}), 500
 
-    msg = f"✅ {BINANCE_MODE}\n{SYMBOL} {side}\nqty={qty}"
-    logger.info(msg)
-    feishu_notify(msg)
+        # 如果方向相反，先平仓
+        try:
+            close_if_reverse(side, pos_qty)
+        except Exception as e:
+            logger.error(f"Failed to close reverse position: {e}")
+            return jsonify({"error": "failed to close reverse position"}), 500
 
-    return jsonify({"status": "ok"})
+        # 检查是否已有同向持仓
+        if side == "LONG" and pos_qty > 0:
+            logger.info(f"Skipping: already have LONG position, qty={pos_qty}")
+            return jsonify({"status": "skip", "reason": "already have LONG position"})
+        if side == "SHORT" and pos_qty < 0:
+            logger.info(f"Skipping: already have SHORT position, qty={pos_qty}")
+            return jsonify({"status": "skip", "reason": "already have SHORT position"})
+
+        # 执行交易
+        try:
+            order_side = "BUY" if side == "LONG" else "SELL"
+            result = client.new_order(
+                symbol=SYMBOL,
+                side=order_side,
+                type="MARKET",
+                quantity=qty
+            )
+            order_id = result.get("orderId")
+            logger.info(f"Order placed: {result}")
+            
+            # 保存交易历史
+            save_trade_history(side, qty, entry, stop, order_id)
+        except ClientError as e:
+            logger.error(f"Failed to place order (ClientError): {e}")
+            return jsonify({"error": f"order failed: {e}"}), 500
+        except Exception as e:
+            logger.error(f"Failed to place order (Unknown): {e}")
+            return jsonify({"error": "order failed"}), 500
+
+        # 发送通知
+        msg = f"✅ {BINANCE_MODE}\n{SYMBOL} {side}\nqty={qty}\nentry={entry}\nstop={stop}"
+        logger.info(msg)
+        feishu_notify(msg)
+
+        return jsonify({"status": "ok", "qty": qty, "side": side, "order_id": order_id})
+
+    except Exception as e:
+        logger.error(f"Unexpected error in webhook: {e}", exc_info=True)
+        return jsonify({"error": "internal server error"}), 500
+
+# ================= Health Check =================
+@app.route("/health", methods=["GET"])
+def health() -> Tuple[Dict[str, Any], int]:
+    """
+    健康检查端点
+    
+    Returns:
+        JSON 响应和状态码
+    """
+    try:
+        # 测试 API 连接
+        client.ping()
+        return jsonify({
+            "status": "healthy",
+            "mode": BINANCE_MODE,
+            "symbol": SYMBOL
+        }), 200
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return jsonify({
+            "status": "unhealthy",
+            "error": str(e)
+        }), 503
+
+# ================= Status Endpoint =================
+@app.route("/status", methods=["GET"])
+def status() -> Tuple[Dict[str, Any], int]:
+    """
+    获取机器人状态信息（余额、持仓、配置）
+    
+    Returns:
+        JSON 响应包含余额、持仓、配置等信息
+    """
+    try:
+        # 获取账户信息
+        account_info = client.account()
+        
+        # 获取余额
+        balance = 0.0
+        try:
+            balance = get_balance()
+        except Exception as e:
+            logger.warning(f"Failed to get balance in status: {e}")
+        
+        # 获取持仓
+        position_qty = 0.0
+        position_info = None
+        try:
+            position_qty = get_position_qty()
+            positions = client.get_position_risk(symbol=SYMBOL)
+            if positions:
+                pos = positions[0]
+                position_info = {
+                    "quantity": float(pos.get("positionAmt", 0)),
+                    "entry_price": float(pos.get("entryPrice", 0)) if pos.get("entryPrice") else None,
+                    "mark_price": float(pos.get("markPrice", 0)) if pos.get("markPrice") else None,
+                    "unrealized_pnl": float(pos.get("unRealizedProfit", 0)) if pos.get("unRealizedProfit") else None,
+                    "leverage": int(pos.get("leverage", LEVERAGE))
+                }
+        except Exception as e:
+            logger.warning(f"Failed to get position in status: {e}")
+        
+        # 获取最近交易历史
+        trade_history = get_trade_history(limit=10)
+        
+        return jsonify({
+            "status": "ok",
+            "mode": BINANCE_MODE,
+            "symbol": SYMBOL,
+            "balance": {
+                "usdt": balance,
+                "total_wallet_balance": float(account_info.get("totalWalletBalance", 0)),
+                "available_balance": float(account_info.get("availableBalance", 0))
+            },
+            "position": {
+                "quantity": position_qty,
+                "side": "LONG" if position_qty > 0 else "SHORT" if position_qty < 0 else "NONE",
+                "details": position_info
+            },
+            "config": {
+                "leverage": LEVERAGE,
+                "risk_pct": RISK_PCT,
+                "qty_precision": QTY_PRECISION
+            },
+            "recent_trades": trade_history,
+            "trade_history_count": len(get_trade_history(limit=0))
+        }), 200
+    except Exception as e:
+        logger.error(f"Failed to get status: {e}")
+        return jsonify({
+            "status": "error",
+            "error": str(e)
+        }), 500
 
 # ================= Main =================
 if __name__ == "__main__":
-    app.run(host=HOST, port=PORT)
+    logger.info(f"Starting Flask server on {HOST}:{PORT}")
+    app.run(host=HOST, port=PORT, debug=False)
 
