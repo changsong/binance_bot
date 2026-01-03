@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import logging
 import requests
 from datetime import datetime
@@ -103,29 +104,105 @@ client = UMFutures(
     base_url=BASE_URL
 )
 
-# 测试 API 连接
-try:
-    account_info = client.account()
-    logger.info(f"✅ API connection successful | Mode: {BINANCE_MODE}")
-except ClientError as e:
-    logger.error(f"❌ API connection failed (ClientError): {e}")
-    logger.error("❌ Please check your API_KEY, API_SECRET, and IP whitelist settings")
-    raise
-except ServerError as e:
-    logger.error(f"❌ API connection failed (ServerError): {e}")
-    logger.error("❌ Binance server error, please try again later")
-    raise
-except Exception as e:
-    logger.error(f"❌ API connection failed (Unknown): {e}")
-    raise
+def handle_rate_limit_error(e: ClientError) -> Optional[int]:
+    """
+    处理速率限制错误，返回需要等待的秒数
+    
+    Args:
+        e: ClientError 异常
+        
+    Returns:
+        需要等待的秒数，如果不是速率限制错误则返回 None
+    """
+    if e.status_code == 418 or (hasattr(e, 'error_code') and e.error_code == -1003):
+        # 提取 retry-after 头
+        retry_after = None
+        if hasattr(e, 'response') and e.response:
+            headers = e.response.headers if hasattr(e.response, 'headers') else {}
+            retry_after_str = headers.get('retry-after', '')
+            if retry_after_str:
+                try:
+                    retry_after = int(retry_after_str)
+                except ValueError:
+                    pass
+        
+        # 如果没有 retry-after，从错误消息中提取时间戳
+        if retry_after is None:
+            error_msg = str(e)
+            if 'banned until' in error_msg:
+                try:
+                    # 提取时间戳（毫秒）
+                    timestamp_str = error_msg.split('banned until')[1].strip().split('.')[0]
+                    banned_until = int(timestamp_str) / 1000  # 转换为秒
+                    retry_after = max(0, int(banned_until - time.time()))
+                except (ValueError, IndexError):
+                    retry_after = 300  # 默认等待 5 分钟
+        
+        return retry_after if retry_after else 300
+    return None
 
-# 尝试设置杠杆
+def test_api_connection_with_retry(max_retries: int = 3) -> bool:
+    """
+    测试 API 连接，带重试机制
+    
+    Args:
+        max_retries: 最大重试次数
+        
+    Returns:
+        连接是否成功
+    """
+    for attempt in range(max_retries):
+        try:
+            # 使用 ping() 而不是 account()，更轻量且不会触发速率限制
+            client.ping()
+            logger.info(f"✅ API connection successful | Mode: {BINANCE_MODE}")
+            return True
+        except ClientError as e:
+            retry_after = handle_rate_limit_error(e)
+            if retry_after:
+                if attempt < max_retries - 1:
+                    logger.warning(f"⚠️ Rate limit hit, waiting {retry_after} seconds before retry ({attempt + 1}/{max_retries})")
+                    time.sleep(retry_after)
+                    continue
+                else:
+                    logger.error(f"❌ Rate limit exceeded after {max_retries} attempts")
+                    logger.error(f"❌ Please wait {retry_after} seconds before restarting")
+                    raise RuntimeError(f"Rate limit exceeded. Please wait {retry_after} seconds before restarting.")
+            else:
+                logger.error(f"❌ API connection failed (ClientError): {e}")
+                logger.error("❌ Please check your API_KEY, API_SECRET, and IP whitelist settings")
+                raise
+        except ServerError as e:
+            logger.error(f"❌ API connection failed (ServerError): {e}")
+            logger.error("❌ Binance server error, please try again later")
+            raise
+        except Exception as e:
+            logger.error(f"❌ API connection failed (Unknown): {e}")
+            raise
+    
+    return False
+
+# 测试 API 连接（带重试）
+test_api_connection_with_retry()
+
+# 尝试设置杠杆（延迟执行，避免速率限制）
+time.sleep(1)  # 等待 1 秒，避免连续请求
 try:
     client.change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
     logger.info(f"✅ Leverage set to {LEVERAGE}x for {SYMBOL}")
 except ClientError as e:
-    logger.warning(f"⚠️ Failed to set leverage (ClientError): {e}")
-    logger.warning("⚠️ Possible reasons: API key lacks permission, IP not whitelisted, or leverage already set")
+    retry_after = handle_rate_limit_error(e)
+    if retry_after:
+        logger.warning(f"⚠️ Rate limit hit when setting leverage, will retry after {retry_after} seconds")
+        time.sleep(retry_after)
+        try:
+            client.change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
+            logger.info(f"✅ Leverage set to {LEVERAGE}x for {SYMBOL} (after retry)")
+        except Exception as retry_e:
+            logger.warning(f"⚠️ Failed to set leverage after retry: {retry_e}")
+    else:
+        logger.warning(f"⚠️ Failed to set leverage (ClientError): {e}")
+        logger.warning("⚠️ Possible reasons: API key lacks permission, IP not whitelisted, or leverage already set")
 except ServerError as e:
     logger.warning(f"⚠️ Failed to set leverage (ServerError): {e}")
 except Exception as e:
@@ -227,43 +304,59 @@ def get_trade_history(limit: int = 50) -> list:
 # ================= Utils =================
 def get_balance() -> float:
     """
-    获取 USDT 余额
+    获取 USDT 余额（带速率限制处理）
     
     Returns:
         USDT 余额，如果获取失败则抛出异常
     """
-    try:
-        balances = client.balance()
-        for b in balances:
-            if b["asset"] == "USDT":
-                return float(b["balance"])
-        logger.warning("USDT balance not found")
-        return 0.0
-    except ClientError as e:
-        logger.error(f"Failed to get balance (ClientError): {e}")
-        raise
-    except Exception as e:
-        logger.error(f"Failed to get balance (Unknown): {e}")
-        raise
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            balances = client.balance()
+            for b in balances:
+                if b["asset"] == "USDT":
+                    return float(b["balance"])
+            logger.warning("USDT balance not found")
+            return 0.0
+        except ClientError as e:
+            retry_after = handle_rate_limit_error(e)
+            if retry_after and attempt < max_retries - 1:
+                logger.warning(f"Rate limit hit when getting balance, waiting {retry_after} seconds")
+                time.sleep(retry_after)
+                continue
+            logger.error(f"Failed to get balance (ClientError): {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Failed to get balance (Unknown): {e}")
+            raise
+    return 0.0
 
 def get_position_qty() -> float:
     """
-    获取当前持仓数量
+    获取当前持仓数量（带速率限制处理）
     
     Returns:
         持仓数量，正数表示多仓，负数表示空仓，0 表示无持仓
     """
-    try:
-        positions = client.get_position_risk(symbol=SYMBOL)
-        if not positions:
-            return 0.0
-        return float(positions[0]["positionAmt"])
-    except ClientError as e:
-        logger.error(f"Failed to get position (ClientError): {e}")
-        raise
-    except Exception as e:
-        logger.error(f"Failed to get position (Unknown): {e}")
-        raise
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            positions = client.get_position_risk(symbol=SYMBOL)
+            if not positions:
+                return 0.0
+            return float(positions[0]["positionAmt"])
+        except ClientError as e:
+            retry_after = handle_rate_limit_error(e)
+            if retry_after and attempt < max_retries - 1:
+                logger.warning(f"Rate limit hit when getting position, waiting {retry_after} seconds")
+                time.sleep(retry_after)
+                continue
+            logger.error(f"Failed to get position (ClientError): {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Failed to get position (Unknown): {e}")
+            raise
+    return 0.0
 
 def calc_qty(entry: float, stop: float) -> float:
     """
@@ -316,7 +409,7 @@ def close_if_reverse(side: str, pos_qty: float) -> None:
 
 def _close(qty: float) -> None:
     """
-    执行平仓操作
+    执行平仓操作（带速率限制处理）
     
     Args:
         qty: 要平仓的数量（正数）
@@ -325,22 +418,30 @@ def _close(qty: float) -> None:
         logger.warning(f"Invalid close qty: {qty}")
         return
     
-    try:
-        side = "BUY" if qty < 0 else "SELL"
-        result = client.new_order(
-            symbol=SYMBOL,
-            side=side,
-            type="MARKET",
-            quantity=abs(qty),
-            reduceOnly=True
-        )
-        logger.info(f"Position closed: qty={qty}, side={side}, order_id={result.get('orderId')}")
-    except ClientError as e:
-        logger.error(f"Failed to close position (ClientError): {e}")
-        raise
-    except Exception as e:
-        logger.error(f"Failed to close position (Unknown): {e}")
-        raise
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            side = "BUY" if qty < 0 else "SELL"
+            result = client.new_order(
+                symbol=SYMBOL,
+                side=side,
+                type="MARKET",
+                quantity=abs(qty),
+                reduceOnly=True
+            )
+            logger.info(f"Position closed: qty={qty}, side={side}, order_id={result.get('orderId')}")
+            return
+        except ClientError as e:
+            retry_after = handle_rate_limit_error(e)
+            if retry_after and attempt < max_retries - 1:
+                logger.warning(f"Rate limit hit when closing position, waiting {retry_after} seconds")
+                time.sleep(retry_after)
+                continue
+            logger.error(f"Failed to close position (ClientError): {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Failed to close position (Unknown): {e}")
+            raise
 
 # ================= Webhook =================
 @app.route("/webhook", methods=["POST"])
@@ -418,26 +519,38 @@ def webhook() -> Tuple[Dict[str, Any], int]:
             logger.info(f"Skipping: already have SHORT position, qty={pos_qty}")
             return jsonify({"status": "skip", "reason": "already have SHORT position"})
 
-        # 执行交易
-        try:
-            order_side = "BUY" if side == "LONG" else "SELL"
-            result = client.new_order(
-                symbol=SYMBOL,
-                side=order_side,
-                type="MARKET",
-                quantity=qty
-            )
-            order_id = result.get("orderId")
-            logger.info(f"Order placed: {result}")
-            
-            # 保存交易历史
-            save_trade_history(side, qty, entry, stop, order_id)
-        except ClientError as e:
-            logger.error(f"Failed to place order (ClientError): {e}")
-            return jsonify({"error": f"order failed: {e}"}), 500
-        except Exception as e:
-            logger.error(f"Failed to place order (Unknown): {e}")
-            return jsonify({"error": "order failed"}), 500
+        # 执行交易（带速率限制处理）
+        max_retries = 3
+        order_id = None
+        for attempt in range(max_retries):
+            try:
+                order_side = "BUY" if side == "LONG" else "SELL"
+                result = client.new_order(
+                    symbol=SYMBOL,
+                    side=order_side,
+                    type="MARKET",
+                    quantity=qty
+                )
+                order_id = result.get("orderId")
+                logger.info(f"Order placed: {result}")
+                
+                # 保存交易历史
+                save_trade_history(side, qty, entry, stop, order_id)
+                break  # 成功则退出循环
+            except ClientError as e:
+                retry_after = handle_rate_limit_error(e)
+                if retry_after and attempt < max_retries - 1:
+                    logger.warning(f"Rate limit hit when placing order, waiting {retry_after} seconds")
+                    time.sleep(retry_after)
+                    continue
+                logger.error(f"Failed to place order (ClientError): {e}")
+                return jsonify({"error": f"order failed: {e}"}), 500
+            except Exception as e:
+                logger.error(f"Failed to place order (Unknown): {e}")
+                return jsonify({"error": "order failed"}), 500
+        
+        if order_id is None:
+            return jsonify({"error": "order failed after retries"}), 500
 
         # 发送通知
         msg = f"✅ {BINANCE_MODE}\n{SYMBOL} {side}\nqty={qty}\nentry={entry}\nstop={stop}"
