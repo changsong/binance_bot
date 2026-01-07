@@ -4,10 +4,11 @@ import time
 import logging
 import requests
 from datetime import datetime
-from typing import Dict, Optional, Tuple, Any
+from typing import Dict, Optional, Tuple, Any, Union
 from logging.handlers import RotatingFileHandler
 from flask import Flask, request, jsonify
 from binance.um_futures import UMFutures
+from binance.client import Client
 from binance.error import ClientError, ServerError
 from dotenv import load_dotenv
 
@@ -19,19 +20,30 @@ BINANCE_MODE = os.getenv("BINANCE_MODE", "testnet").lower()
 if BINANCE_MODE not in ("testnet", "main"):
     raise RuntimeError("BINANCE_MODE must be testnet or main")
 
+# ========== TRADE TYPE ==========
+TRADE_TYPE = os.getenv("TRADE_TYPE", "futures").lower()
+if TRADE_TYPE not in ("futures", "spot"):
+    raise RuntimeError("TRADE_TYPE must be futures or spot")
+
 # ========== API KEY ==========
 if BINANCE_MODE == "testnet":
     API_KEY = os.getenv("BINANCE_TEST_API_KEY")
     API_SECRET = os.getenv("BINANCE_TEST_API_SECRET")
-    BASE_URL = "https://testnet.binancefuture.com"
+    if TRADE_TYPE == "futures":
+        BASE_URL = "https://testnet.binancefuture.com"
+    else:
+        BASE_URL = "https://testnet.binance.vision"
 else:
     API_KEY = os.getenv("BINANCE_MAIN_API_KEY")
     API_SECRET = os.getenv("BINANCE_MAIN_API_SECRET")
-    BASE_URL = "https://fapi.binance.com"
+    if TRADE_TYPE == "futures":
+        BASE_URL = "https://fapi.binance.com"
+    else:
+        BASE_URL = None  # 现货使用默认 URL
 
 # ========== Trading ==========
 SYMBOL = "BTCUSDT"
-LEVERAGE = int(os.getenv("LEVERAGE", 3))
+LEVERAGE = int(os.getenv("LEVERAGE", 3)) if TRADE_TYPE == "futures" else 1
 RISK_PCT = float(os.getenv("RISK_PCT", 0.01))
 QTY_PRECISION = int(os.getenv("QTY_PRECISION", 3))
 SKIP_LEVERAGE_SETUP = os.getenv("SKIP_LEVERAGE_SETUP", "false").lower() == "true"
@@ -66,7 +78,7 @@ if missing:
 if RISK_PCT <= 0 or RISK_PCT > 1:
     raise RuntimeError(f"RISK_PCT must be between 0 and 1, got {RISK_PCT}")
 
-if LEVERAGE < 1 or LEVERAGE > 125:
+if TRADE_TYPE == "futures" and (LEVERAGE < 1 or LEVERAGE > 125):
     raise RuntimeError(f"LEVERAGE must be between 1 and 125, got {LEVERAGE}")
 
 if QTY_PRECISION < 0 or QTY_PRECISION > 8:
@@ -99,11 +111,21 @@ logger.addHandler(console_handler)
 app = Flask(__name__)
 
 # ================= Binance 客户端初始化 =================
-client = UMFutures(
-    key=API_KEY,
-    secret=API_SECRET,
-    base_url=BASE_URL
-)
+if TRADE_TYPE == "futures":
+    client: Union[UMFutures, Client] = UMFutures(
+        key=API_KEY,
+        secret=API_SECRET,
+        base_url=BASE_URL
+    )
+else:
+    # 现货交易
+    client = Client(
+        api_key=API_KEY,
+        api_secret=API_SECRET,
+        testnet=(BINANCE_MODE == "testnet")
+    )
+    if BINANCE_MODE == "testnet":
+        client.API_URL = "https://testnet.binance.vision/api"
 
 def handle_rate_limit_error(e: ClientError) -> Optional[int]:
     """
@@ -186,8 +208,8 @@ def test_api_connection_with_retry(max_retries: int = 3) -> bool:
 # 测试 API 连接（带重试）
 test_api_connection_with_retry()
 
-# 尝试设置杠杆（如果未跳过）
-if not SKIP_LEVERAGE_SETUP:
+# 尝试设置杠杆（仅期货，如果未跳过）
+if TRADE_TYPE == "futures" and not SKIP_LEVERAGE_SETUP:
     time.sleep(1)  # 等待 1 秒，避免连续请求
     try:
         client.change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
@@ -218,10 +240,12 @@ if not SKIP_LEVERAGE_SETUP:
         logger.warning(f"⚠️ Failed to set leverage (ServerError): {e}")
     except Exception as e:
         logger.warning(f"⚠️ Failed to set leverage (Unknown): {e}")
-else:
-    logger.info(f"⏭️ Skipping leverage setup (SKIP_LEVERAGE_SETUP=true)")
+    else:
+        logger.info(f"⏭️ Skipping leverage setup (SKIP_LEVERAGE_SETUP=true)")
+elif TRADE_TYPE == "spot":
+    logger.info(f"ℹ️ Spot trading mode: leverage not applicable")
 
-logger.info(f"🚀 BOT STARTED | MODE={BINANCE_MODE} | SYMBOL={SYMBOL} | LEVERAGE={LEVERAGE}x")
+logger.info(f"🚀 BOT STARTED | MODE={BINANCE_MODE} | TYPE={TRADE_TYPE} | SYMBOL={SYMBOL} | LEVERAGE={LEVERAGE}x")
 
 # ================= Feishu =================
 def feishu_notify(msg: str) -> None:
@@ -325,10 +349,17 @@ def get_balance() -> float:
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            balances = client.balance()
-            for b in balances:
-                if b["asset"] == "USDT":
-                    return float(b["balance"])
+            if TRADE_TYPE == "futures":
+                balances = client.balance()
+                for b in balances:
+                    if b["asset"] == "USDT":
+                        return float(b["balance"])
+            else:
+                # 现货交易
+                account = client.get_account()
+                for b in account["balances"]:
+                    if b["asset"] == "USDT":
+                        return float(b["free"])
             logger.warning("USDT balance not found")
             return 0.0
         except ClientError as e:
@@ -349,15 +380,26 @@ def get_position_qty() -> float:
     获取当前持仓数量（带速率限制处理）
     
     Returns:
-        持仓数量，正数表示多仓，负数表示空仓，0 表示无持仓
+        持仓数量，正数表示多仓（或现货持仓），负数表示空仓，0 表示无持仓
     """
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            positions = client.get_position_risk(symbol=SYMBOL)
-            if not positions:
+            if TRADE_TYPE == "futures":
+                positions = client.get_position_risk(symbol=SYMBOL)
+                if not positions:
+                    return 0.0
+                return float(positions[0]["positionAmt"])
+            else:
+                # 现货交易：查询持有的币种数量
+                account = client.get_account()
+                base_asset = SYMBOL.replace("USDT", "")  # 例如 BTCUSDT -> BTC
+                for b in account["balances"]:
+                    if b["asset"] == base_asset:
+                        qty = float(b["free"])
+                        # 现货只有多仓（持有），返回正数表示持有数量
+                        return qty if qty > 0 else 0.0
                 return 0.0
-            return float(positions[0]["positionAmt"])
         except ClientError as e:
             retry_after = handle_rate_limit_error(e)
             if retry_after and attempt < max_retries - 1:
@@ -413,12 +455,21 @@ def close_if_reverse(side: str, pos_qty: float) -> None:
         side: 交易方向 (LONG/SHORT)
         pos_qty: 当前持仓数量
     """
-    if side == "LONG" and pos_qty < 0:
-        logger.info(f"Closing reverse position: side={side}, pos_qty={pos_qty}")
-        _close(abs(pos_qty))
-    elif side == "SHORT" and pos_qty > 0:
-        logger.info(f"Closing reverse position: side={side}, pos_qty={pos_qty}")
-        _close(abs(pos_qty))
+    if TRADE_TYPE == "futures":
+        # 期货：处理反向持仓
+        if side == "LONG" and pos_qty < 0:
+            logger.info(f"Closing reverse position: side={side}, pos_qty={pos_qty}")
+            _close(abs(pos_qty))
+        elif side == "SHORT" and pos_qty > 0:
+            logger.info(f"Closing reverse position: side={side}, pos_qty={pos_qty}")
+            _close(abs(pos_qty))
+    else:
+        # 现货：如果要做空但持有现货，需要先卖出
+        # 如果要做多但持有现货，可以继续持有或先卖出再买入
+        if side == "SHORT" and pos_qty > 0:
+            logger.info(f"Closing spot position before SHORT: pos_qty={pos_qty}")
+            _close(pos_qty)
+        # 现货做多时，如果已有持仓，可以选择加仓或跳过
 
 def _close(qty: float) -> None:
     """
@@ -434,15 +485,22 @@ def _close(qty: float) -> None:
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            side = "BUY" if qty < 0 else "SELL"
-            result = client.new_order(
-                symbol=SYMBOL,
-                side=side,
-                type="MARKET",
-                quantity=abs(qty),
-                reduceOnly=True
-            )
-            logger.info(f"Position closed: qty={qty}, side={side}, order_id={result.get('orderId')}")
+            if TRADE_TYPE == "futures":
+                side = "BUY" if qty < 0 else "SELL"
+                result = client.new_order(
+                    symbol=SYMBOL,
+                    side=side,
+                    type="MARKET",
+                    quantity=abs(qty),
+                    reduceOnly=True
+                )
+            else:
+                # 现货：卖出持有的币种
+                result = client.order_market_sell(
+                    symbol=SYMBOL,
+                    quantity=qty
+                )
+            logger.info(f"Position closed: qty={qty}, order_id={result.get('orderId')}")
             return
         except ClientError as e:
             retry_after = handle_rate_limit_error(e)
@@ -525,25 +583,48 @@ def webhook() -> Tuple[Dict[str, Any], int]:
             return jsonify({"error": "failed to close reverse position"}), 500
 
         # 检查是否已有同向持仓
-        if side == "LONG" and pos_qty > 0:
-            logger.info(f"Skipping: already have LONG position, qty={pos_qty}")
-            return jsonify({"status": "skip", "reason": "already have LONG position"})
-        if side == "SHORT" and pos_qty < 0:
-            logger.info(f"Skipping: already have SHORT position, qty={pos_qty}")
-            return jsonify({"status": "skip", "reason": "already have SHORT position"})
+        if TRADE_TYPE == "futures":
+            if side == "LONG" and pos_qty > 0:
+                logger.info(f"Skipping: already have LONG position, qty={pos_qty}")
+                return jsonify({"status": "skip", "reason": "already have LONG position"})
+            if side == "SHORT" and pos_qty < 0:
+                logger.info(f"Skipping: already have SHORT position, qty={pos_qty}")
+                return jsonify({"status": "skip", "reason": "already have SHORT position"})
+        else:
+            # 现货：不支持做空
+            if side == "SHORT":
+                logger.warning("SHORT orders not supported in spot trading")
+                return jsonify({"error": "SHORT orders not supported in spot trading"}), 400
+            # 现货做多时，如果已有持仓可以选择加仓或跳过
+            if side == "LONG" and pos_qty > 0:
+                logger.info(f"Already have spot position, will add to position: current_qty={pos_qty}")
 
         # 执行交易（带速率限制处理）
         max_retries = 3
         order_id = None
         for attempt in range(max_retries):
             try:
-                order_side = "BUY" if side == "LONG" else "SELL"
-                result = client.new_order(
-                    symbol=SYMBOL,
-                    side=order_side,
-                    type="MARKET",
-                    quantity=qty
-                )
+                if TRADE_TYPE == "futures":
+                    order_side = "BUY" if side == "LONG" else "SELL"
+                    result = client.new_order(
+                        symbol=SYMBOL,
+                        side=order_side,
+                        type="MARKET",
+                        quantity=qty
+                    )
+                else:
+                    # 现货：只支持买入，使用市价单
+                    if side == "LONG":
+                        # 现货买入：使用 quoteOrderQty（USDT 金额）或 quantity（币数量）
+                        # 这里使用 USDT 金额更准确
+                        usdt_amount = qty * entry
+                        result = client.order_market_buy(
+                            symbol=SYMBOL,
+                            quoteOrderQty=round(usdt_amount, 2)  # USDT 金额，保留2位小数
+                        )
+                    else:
+                        raise ValueError("SHORT orders not supported in spot trading")
+                
                 order_id = result.get("orderId")
                 logger.info(f"Order placed: {result}")
                 
@@ -591,6 +672,7 @@ def health() -> Tuple[Dict[str, Any], int]:
         return jsonify({
             "status": "healthy",
             "mode": BINANCE_MODE,
+            "trade_type": TRADE_TYPE,
             "symbol": SYMBOL
         }), 200
     except Exception as e:
@@ -611,7 +693,10 @@ def status() -> Tuple[Dict[str, Any], int]:
     """
     try:
         # 获取账户信息
-        account_info = client.account()
+        if TRADE_TYPE == "futures":
+            account_info = client.account()
+        else:
+            account_info = client.get_account()
         
         # 获取余额
         balance = 0.0
@@ -625,30 +710,46 @@ def status() -> Tuple[Dict[str, Any], int]:
         position_info = None
         try:
             position_qty = get_position_qty()
-            positions = client.get_position_risk(symbol=SYMBOL)
-            if positions:
-                pos = positions[0]
-                position_info = {
-                    "quantity": float(pos.get("positionAmt", 0)),
-                    "entry_price": float(pos.get("entryPrice", 0)) if pos.get("entryPrice") else None,
-                    "mark_price": float(pos.get("markPrice", 0)) if pos.get("markPrice") else None,
-                    "unrealized_pnl": float(pos.get("unRealizedProfit", 0)) if pos.get("unRealizedProfit") else None,
-                    "leverage": int(pos.get("leverage", LEVERAGE))
-                }
+            if TRADE_TYPE == "futures":
+                positions = client.get_position_risk(symbol=SYMBOL)
+                if positions:
+                    pos = positions[0]
+                    position_info = {
+                        "quantity": float(pos.get("positionAmt", 0)),
+                        "entry_price": float(pos.get("entryPrice", 0)) if pos.get("entryPrice") else None,
+                        "mark_price": float(pos.get("markPrice", 0)) if pos.get("markPrice") else None,
+                        "unrealized_pnl": float(pos.get("unRealizedProfit", 0)) if pos.get("unRealizedProfit") else None,
+                        "leverage": int(pos.get("leverage", LEVERAGE))
+                    }
+            else:
+                # 现货：显示持有的币种数量
+                base_asset = SYMBOL.replace("USDT", "")
+                if position_qty > 0:
+                    # 获取当前价格来计算价值
+                    try:
+                        ticker = client.get_symbol_ticker(symbol=SYMBOL)
+                        current_price = float(ticker.get("price", 0))
+                        value_usdt = position_qty * current_price if current_price > 0 else None
+                    except:
+                        value_usdt = None
+                    position_info = {
+                        "quantity": position_qty,
+                        "asset": base_asset,
+                        "value_usdt": value_usdt
+                    }
         except Exception as e:
             logger.warning(f"Failed to get position in status: {e}")
         
         # 获取最近交易历史
         trade_history = get_trade_history(limit=10)
         
-        return jsonify({
+        response_data = {
             "status": "ok",
             "mode": BINANCE_MODE,
+            "trade_type": TRADE_TYPE,
             "symbol": SYMBOL,
             "balance": {
-                "usdt": balance,
-                "total_wallet_balance": float(account_info.get("totalWalletBalance", 0)),
-                "available_balance": float(account_info.get("availableBalance", 0))
+                "usdt": balance
             },
             "position": {
                 "quantity": position_qty,
@@ -656,13 +757,23 @@ def status() -> Tuple[Dict[str, Any], int]:
                 "details": position_info
             },
             "config": {
-                "leverage": LEVERAGE,
+                "leverage": LEVERAGE if TRADE_TYPE == "futures" else 1,
                 "risk_pct": RISK_PCT,
                 "qty_precision": QTY_PRECISION
             },
             "recent_trades": trade_history,
             "trade_history_count": len(get_trade_history(limit=0))
-        }), 200
+        }
+        
+        # 添加期货特有的余额信息
+        if TRADE_TYPE == "futures":
+            response_data["balance"]["total_wallet_balance"] = float(account_info.get("totalWalletBalance", 0))
+            response_data["balance"]["available_balance"] = float(account_info.get("availableBalance", 0))
+        else:
+            # 现货：显示总资产
+            response_data["balance"]["available"] = balance
+        
+        return jsonify(response_data), 200
     except Exception as e:
         logger.error(f"Failed to get status: {e}")
         return jsonify({
