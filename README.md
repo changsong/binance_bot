@@ -62,7 +62,7 @@ python app.py
 ### POST /webhook
 接收交易信号并执行交易
 
-**请求体：**
+**请求体（JSON）：**
 ```json
 {
   "secret": "your_webhook_secret",
@@ -71,6 +71,23 @@ python app.py
   "stop": 49000.0
 }
 ```
+
+**或者通过 URL 查询参数传递 secret：**
+```
+POST /webhook?secret=your_webhook_secret
+Content-Type: application/json
+
+{
+  "side": "LONG",
+  "entry": 50000.0,
+  "stop": 49000.0
+}
+```
+
+**TradingView Alert 配置：**
+在 TradingView 中配置 webhook URL 时，可以：
+1. 在 URL 中添加 secret：`http://your-server/webhook?secret=your_webhook_secret`
+2. 或者在 JSON 消息中包含 secret 字段
 
 **响应：**
 ```json

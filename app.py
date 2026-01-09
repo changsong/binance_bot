@@ -524,7 +524,28 @@ def webhook() -> Tuple[Dict[str, Any], int]:
         JSON 响应和 HTTP 状态码
     """
     try:
+        # 尝试多种方式获取 JSON 数据
+        data = None
+        
+        # 方法1: 尝试从 JSON 请求体获取
         data = request.get_json(force=True, silent=True)
+        
+        # 方法2: 如果失败，尝试从原始数据获取（TradingView 可能发送纯文本 JSON）
+        if not data:
+            raw_data = request.get_data(as_text=True)
+            logger.info(f"Raw webhook data: {raw_data[:200]}")  # 记录前200字符用于调试
+            
+            if raw_data:
+                try:
+                    # 尝试解析 JSON 字符串
+                    data = json.loads(raw_data)
+                    logger.info("Successfully parsed JSON from raw data")
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Failed to parse JSON from raw data: {e}")
+                    # 方法3: 尝试从表单数据获取
+                    if request.form:
+                        data = dict(request.form)
+                        logger.info("Using form data")
         
         # 记录请求（脱敏处理）
         log_data = {k: v for k, v in data.items() if k != "secret"} if data else None
@@ -533,11 +554,15 @@ def webhook() -> Tuple[Dict[str, Any], int]:
         # 验证 JSON
         if not data:
             logger.warning("Invalid JSON in webhook request")
+            logger.warning(f"Content-Type: {request.content_type}")
+            logger.warning(f"Raw data: {request.get_data(as_text=True)[:500]}")
             return jsonify({"error": "invalid json"}), 400
 
-        # 验证密钥
-        if data.get("secret") != WEBHOOK_SECRET:
+        # 验证密钥（支持从 JSON 或 URL 查询参数获取）
+        secret = data.get("secret") or request.args.get("secret")
+        if secret != WEBHOOK_SECRET:
             logger.warning("Unauthorized webhook request")
+            logger.warning(f"Received secret: {secret[:10] if secret else 'None'}...")
             return jsonify({"error": "unauthorized"}), 403
 
         # 验证和解析参数
