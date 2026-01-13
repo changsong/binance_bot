@@ -97,7 +97,8 @@ handler = RotatingFileHandler(
     backupCount=5
 )
 formatter = logging.Formatter(
-    "%(asctime)s | %(levelname)s | %(message)s"
+    "%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"  # 添加这个参数，指定时间格式
 )
 handler.setFormatter(formatter)
 logger.addHandler(handler)
