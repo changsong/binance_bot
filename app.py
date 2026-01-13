@@ -6,7 +6,7 @@ import requests
 from datetime import datetime
 from typing import Dict, Optional, Tuple, Any, Union
 from logging.handlers import RotatingFileHandler
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template_string
 from binance.um_futures import UMFutures
 from binance.client import Client
 from binance.error import ClientError, ServerError
@@ -209,7 +209,7 @@ def feishu_notify(msg: str) -> None:
         logger.error(f"Feishu error: {e}")
 
 # ================= 交易历史记录 =================
-def save_trade_history(side: str, qty: float, entry: float, stop: float, order_id: Optional[int] = None) -> None:
+def save_trade_history(side: str, qty: float, entry: float, stop: float, order_id: Optional[int] = None, symbol: Optional[str] = None, message: Optional[str] = None) -> None:
     """
     保存交易记录到文件
     
@@ -219,6 +219,8 @@ def save_trade_history(side: str, qty: float, entry: float, stop: float, order_i
         entry: 入场价格
         stop: 止损价格
         order_id: 订单ID（可选）
+        symbol: 交易标的（可选，默认使用 SYMBOL）
+        message: 交易消息/备注（可选）
     """
     try:
         trade_record = {
@@ -228,9 +230,13 @@ def save_trade_history(side: str, qty: float, entry: float, stop: float, order_i
             "entry": entry,
             "stop": stop,
             "order_id": order_id,
-            "symbol": SYMBOL,
+            "symbol": symbol or SYMBOL,
             "mode": BINANCE_MODE
         }
+        
+        # 如果提供了消息，添加到记录中
+        if message:
+            trade_record["message"] = message
         
         # 读取现有历史记录
         history = []
@@ -588,6 +594,130 @@ def webhook() -> Tuple[Dict[str, Any], int]:
         logger.error(f"Unexpected error in webhook: {e}", exc_info=True)
         return jsonify({"error": "internal server error"}), 500
 
+# ================= A股 Webhook =================
+@app.route("/webhook_a_stock", methods=["POST"])
+def webhook_a_stock() -> Tuple[Dict[str, Any], int]:
+    """
+    处理 A 股交易 webhook 请求（仅做多）
+    只记录交易历史和发送飞书通知，不执行实际交易
+    
+    Returns:
+        JSON 响应和 HTTP 状态码
+    """
+    try:
+        # 尝试多种方式获取 JSON 数据
+        data = None
+        
+        # 方法1: 尝试从 JSON 请求体获取
+        data = request.get_json(force=True, silent=True)
+        
+        # 方法2: 如果失败，尝试从原始数据获取（TradingView 可能发送纯文本 JSON）
+        if not data:
+            raw_data = request.get_data(as_text=True)
+            logger.info(f"Raw stock webhook data: {raw_data[:200]}")
+            
+            if raw_data:
+                try:
+                    data = json.loads(raw_data)
+                    logger.info("Successfully parsed JSON from raw data")
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Failed to parse JSON from raw data: {e}")
+                    if request.form:
+                        data = dict(request.form)
+                        logger.info("Using form data")
+        
+        # 记录请求（脱敏处理）
+        log_data = {k: v for k, v in data.items() if k != "secret"} if data else None
+        logger.info(f"Stock webhook received: {log_data}")
+
+        # 验证 JSON
+        if not data:
+            logger.warning("Invalid JSON in stock webhook request")
+            return jsonify({"error": "invalid json"}), 400
+
+        # 验证密钥（支持从 JSON 或 URL 查询参数获取）
+        secret = data.get("secret") or request.args.get("secret")
+        if secret != WEBHOOK_SECRET:
+            logger.warning("Unauthorized stock webhook request")
+            return jsonify({"error": "unauthorized"}), 403
+
+        # 验证 action（只处理 ENTRY，忽略 EXIT）
+        action = data.get("action", "ENTRY").upper()
+        if action != "ENTRY":
+            logger.info(f"Ignoring non-ENTRY action: {action}")
+            return jsonify({"status": "ignored", "reason": f"action {action} not processed"}), 200
+
+        # 验证和解析参数
+        side = data.get("side", "").upper()
+        if side != "LONG":
+            logger.warning(f"Stock webhook only supports LONG, got: {side}")
+            return jsonify({"error": "only LONG orders are supported"}), 400
+
+        # 获取交易参数
+        symbol = data.get("symbol", "")
+        try:
+            qty = float(data.get("qty", 0))
+            entry = float(data.get("entry", 0))
+            stop = float(data.get("stop", 0))
+        except (ValueError, TypeError) as e:
+            logger.warning(f"Invalid qty/entry/stop values: {e}")
+            return jsonify({"error": "invalid qty, entry or stop value"}), 400
+
+        # 验证价格参数
+        if entry <= 0 or stop <= 0 or qty <= 0:
+            logger.warning(f"Invalid values: qty={qty}, entry={entry}, stop={stop}")
+            return jsonify({"error": "qty, entry and stop must be positive"}), 400
+
+        # 获取可选参数
+        tp1 = data.get("tp1")
+        tp2 = data.get("tp2")
+        score = data.get("score")
+        
+        # 发送飞书通知
+        msg_parts = [
+            f"📈 A股交易信号",
+            f"标的: {symbol}",
+            f"方向: {side}",
+            f"数量: {qty}",
+            f"入场: {entry}",
+            f"止损: {stop}"
+        ]
+        if tp1:
+            msg_parts.append(f"止盈1: {tp1}")
+        if tp2:
+            msg_parts.append(f"止盈2: {tp2}")
+        if score:
+            msg_parts.append(f"评分: {score}")
+        
+        msg = "\n".join(msg_parts)
+        logger.info(f"Stock trade signal: {msg}")
+        feishu_notify(msg)
+
+        # 保存交易历史
+        save_trade_history(
+            side=side,
+            qty=qty,
+            entry=entry,
+            stop=stop,
+            order_id=None,
+            symbol=symbol,
+            message=msg
+        )
+
+        return jsonify({
+            "status": "ok",
+            "symbol": symbol,
+            "side": side,
+            "qty": qty,
+            "entry": entry,
+            "stop": stop,
+            "message": "Trade signal recorded"
+        }), 200
+
+    except Exception as e:
+        logger.error(f"Unexpected error in stock webhook: {e}", exc_info=True)
+        return jsonify({"error": "internal server error"}), 500
+
 # ================= Health Check =================
 @app.route("/health", methods=["GET"])
 def health() -> Tuple[Dict[str, Any], int]:
@@ -710,6 +840,457 @@ def status() -> Tuple[Dict[str, Any], int]:
         return jsonify({
             "status": "error",
             "error": str(e)
+        }), 500
+
+# ================= Trade History Page =================
+@app.route("/history", methods=["GET"])
+def history_page() -> str:
+    """
+    显示交易历史页面
+    
+    Returns:
+        HTML 页面
+    """
+    html_template = """
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>交易历史 - Binance Bot</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
+            overflow: hidden;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+        
+        .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+        
+        .header .subtitle {
+            opacity: 0.9;
+            font-size: 1.1em;
+        }
+        
+        .info-bar {
+            background: #f8f9fa;
+            padding: 15px 30px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid #e9ecef;
+            flex-wrap: wrap;
+            gap: 15px;
+        }
+        
+        .info-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .info-item strong {
+            color: #495057;
+        }
+        
+        .status-badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 0.85em;
+            font-weight: 600;
+        }
+        
+        .status-testnet {
+            background: #fff3cd;
+            color: #856404;
+        }
+        
+        .status-main {
+            background: #d1ecf1;
+            color: #0c5460;
+        }
+        
+        .refresh-indicator {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            color: #6c757d;
+            font-size: 0.9em;
+        }
+        
+        .refresh-indicator .spinner {
+            width: 16px;
+            height: 16px;
+            border: 2px solid #e9ecef;
+            border-top-color: #667eea;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
+        
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        
+        .content {
+            padding: 30px;
+        }
+        
+        .table-container {
+            overflow-x: auto;
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: white;
+        }
+        
+        thead {
+            background: #f8f9fa;
+            position: sticky;
+            top: 0;
+            z-index: 10;
+        }
+        
+        th {
+            padding: 15px;
+            text-align: left;
+            font-weight: 600;
+            color: #495057;
+            border-bottom: 2px solid #dee2e6;
+            white-space: nowrap;
+        }
+        
+        td {
+            padding: 15px;
+            border-bottom: 1px solid #e9ecef;
+            color: #212529;
+        }
+        
+        tbody tr {
+            transition: background-color 0.2s;
+        }
+        
+        tbody tr:hover {
+            background-color: #f8f9fa;
+        }
+        
+        .side-long {
+            color: #28a745;
+            font-weight: 600;
+        }
+        
+        .side-short {
+            color: #dc3545;
+            font-weight: 600;
+        }
+        
+        .timestamp {
+            font-family: 'Courier New', monospace;
+            font-size: 0.9em;
+            color: #6c757d;
+        }
+        
+        .number {
+            font-family: 'Courier New', monospace;
+            text-align: right;
+        }
+        
+        .symbol {
+            font-weight: 600;
+            color: #667eea;
+        }
+        
+        .message-cell {
+            max-width: 400px;
+            white-space: pre-wrap;
+            word-break: break-word;
+            font-size: 0.9em;
+            color: #6c757d;
+            line-height: 1.5;
+        }
+        
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            color: #6c757d;
+        }
+        
+        .empty-state svg {
+            width: 80px;
+            height: 80px;
+            margin-bottom: 20px;
+            opacity: 0.5;
+        }
+        
+        .empty-state h2 {
+            font-size: 1.5em;
+            margin-bottom: 10px;
+        }
+        
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #6c757d;
+        }
+        
+        @media (max-width: 768px) {
+            .header h1 {
+                font-size: 1.8em;
+            }
+            
+            .info-bar {
+                flex-direction: column;
+                align-items: flex-start;
+            }
+            
+            th, td {
+                padding: 10px 8px;
+                font-size: 0.9em;
+            }
+            
+            .message-cell {
+                max-width: 200px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>📊 交易历史</h1>
+            <div class="subtitle">Binance Trading Bot</div>
+        </div>
+        
+        <div class="info-bar">
+            <div class="info-item">
+                <strong>模式:</strong>
+                <span class="status-badge status-{{ mode }}">{{ mode.upper() }}</span>
+            </div>
+            <div class="info-item">
+                <strong>交易类型:</strong>
+                <span>{{ trade_type.upper() }}</span>
+            </div>
+            <div class="info-item">
+                <strong>标的:</strong>
+                <span class="symbol">{{ symbol }}</span>
+            </div>
+            <div class="info-item">
+                <strong>记录数:</strong>
+                <span id="record-count">-</span>
+            </div>
+            <div class="refresh-indicator">
+                <div class="spinner" id="refresh-spinner"></div>
+                <span id="last-update">加载中...</span>
+            </div>
+        </div>
+        
+        <div class="content">
+            <div class="table-container">
+                <div id="loading" class="loading">正在加载数据...</div>
+                <div id="empty-state" class="empty-state" style="display: none;">
+                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                    </svg>
+                    <h2>暂无交易记录</h2>
+                    <p>交易记录将在这里显示</p>
+                </div>
+                <table id="history-table" style="display: none;">
+                    <thead>
+                        <tr>
+                            <th>时间</th>
+                            <th>标的</th>
+                            <th>方向</th>
+                            <th>数量</th>
+                            <th>入场价</th>
+                            <th>止损价</th>
+                            <th>订单ID</th>
+                            <th>消息</th>
+                        </tr>
+                    </thead>
+                    <tbody id="history-tbody">
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        let refreshInterval;
+        let refreshTimeout;
+        
+        function formatTimestamp(timestamp) {
+            try {
+                const date = new Date(timestamp);
+                const year = date.getFullYear();
+                const month = String(date.getMonth() + 1).padStart(2, '0');
+                const day = String(date.getDate()).padStart(2, '0');
+                const hours = String(date.getHours()).padStart(2, '0');
+                const minutes = String(date.getMinutes()).padStart(2, '0');
+                const seconds = String(date.getSeconds()).padStart(2, '0');
+                return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
+            } catch (e) {
+                return timestamp;
+            }
+        }
+        
+        function formatNumber(num) {
+            if (num === null || num === undefined) return '-';
+            return Number(num).toLocaleString('zh-CN', {
+                minimumFractionDigits: 0,
+                maximumFractionDigits: 8
+            });
+        }
+        
+        function updateLastUpdateTime() {
+            const now = new Date();
+            const timeStr = now.toLocaleTimeString('zh-CN');
+            document.getElementById('last-update').textContent = `最后更新: ${timeStr}`;
+        }
+        
+        function loadHistory() {
+            document.getElementById('refresh-spinner').style.display = 'block';
+            
+            fetch('/api/history')
+                .then(response => response.json())
+                .then(data => {
+                    const tbody = document.getElementById('history-tbody');
+                    const table = document.getElementById('history-table');
+                    const loading = document.getElementById('loading');
+                    const emptyState = document.getElementById('empty-state');
+                    
+                    loading.style.display = 'none';
+                    
+                    if (!data.history || data.history.length === 0) {
+                        table.style.display = 'none';
+                        emptyState.style.display = 'block';
+                        document.getElementById('record-count').textContent = '0';
+                        return;
+                    }
+                    
+                    emptyState.style.display = 'none';
+                    table.style.display = 'table';
+                    document.getElementById('record-count').textContent = data.history.length;
+                    
+                    // 反转数组，最新的在前
+                    const reversedHistory = [...data.history].reverse();
+                    
+                    tbody.innerHTML = reversedHistory.map(trade => {
+                        const sideClass = trade.side === 'LONG' ? 'side-long' : 'side-short';
+                        const sideIcon = trade.side === 'LONG' ? '📈' : '📉';
+                        
+                        return `
+                            <tr>
+                                <td class="timestamp">${formatTimestamp(trade.timestamp)}</td>
+                                <td class="symbol">${trade.symbol || '-'}</td>
+                                <td class="${sideClass}">${sideIcon} ${trade.side}</td>
+                                <td class="number">${formatNumber(trade.qty)}</td>
+                                <td class="number">${formatNumber(trade.entry)}</td>
+                                <td class="number">${formatNumber(trade.stop)}</td>
+                                <td class="number">${trade.order_id || '-'}</td>
+                                <td class="message-cell">${trade.message || '-'}</td>
+                            </tr>
+                        `;
+                    }).join('');
+                    
+                    updateLastUpdateTime();
+                })
+                .catch(error => {
+                    console.error('Error loading history:', error);
+                    document.getElementById('loading').textContent = '加载失败，请刷新页面重试';
+                })
+                .finally(() => {
+                    document.getElementById('refresh-spinner').style.display = 'none';
+                });
+        }
+        
+        function startAutoRefresh() {
+            // 立即加载一次
+            loadHistory();
+            
+            // 每60秒刷新一次
+            refreshInterval = setInterval(() => {
+                loadHistory();
+            }, 60000);
+        }
+        
+        // 页面加载时开始自动刷新
+        window.addEventListener('load', () => {
+            startAutoRefresh();
+        });
+        
+        // 页面可见性变化时暂停/恢复刷新
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden) {
+                clearInterval(refreshInterval);
+            } else {
+                loadHistory();
+                refreshInterval = setInterval(() => {
+                    loadHistory();
+                }, 60000);
+            }
+        });
+        
+        // 页面卸载时清理
+        window.addEventListener('beforeunload', () => {
+            clearInterval(refreshInterval);
+            clearTimeout(refreshTimeout);
+        });
+    </script>
+</body>
+</html>
+    """
+    return render_template_string(html_template, mode=BINANCE_MODE, trade_type=TRADE_TYPE, symbol=SYMBOL)
+
+@app.route("/api/history", methods=["GET"])
+def api_history() -> Tuple[Dict[str, Any], int]:
+    """
+    获取交易历史 API（用于页面 AJAX 请求）
+    
+    Returns:
+        JSON 响应包含交易历史
+    """
+    try:
+        limit = request.args.get("limit", default=100, type=int)
+        history = get_trade_history(limit=limit)
+        return jsonify({
+            "status": "ok",
+            "history": history,
+            "count": len(history)
+        }), 200
+    except Exception as e:
+        logger.error(f"Failed to get history API: {e}")
+        return jsonify({
+            "status": "error",
+            "error": str(e),
+            "history": []
         }), 500
 
 # ================= Main =================

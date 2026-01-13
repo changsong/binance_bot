@@ -54,6 +54,7 @@ python app.py
 
 - `app.py` - Flask 应用主文件，包含所有配置、webhook 接口和工具函数
 - `init_testnet.py` - 测试网连接测试脚本
+- `streamlit_history.py` - Streamlit 交易历史展示页面
 - `requirements.txt` - Python 依赖包列表
 - `env.example` - 环境变量配置模板
 
@@ -129,6 +130,28 @@ Content-Type: application/json
   "trade_history_count": 10
 }
 ```
+
+### GET /history
+Flask 内置的交易历史 HTML 页面（简单版本）
+
+### Streamlit 交易历史页面
+使用 Streamlit 构建的现代化交易历史展示界面
+
+**运行方式：**
+```bash
+streamlit run streamlit_history.py
+```
+
+**功能特性：**
+- 📊 美观的数据表格展示
+- 🔍 支持按方向、标的筛选
+- 📈 统计信息（总记录数、做多/做空次数等）
+- 📥 导出 CSV 功能
+- 🔄 自动刷新（可配置刷新间隔）
+- 📱 响应式设计，支持移动端
+- ⚙️ 侧边栏配置面板
+
+页面会在浏览器中自动打开（通常是 `http://localhost:8501`）
 
 ## 环境变量说明
 
