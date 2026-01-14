@@ -442,7 +442,9 @@ def _close(qty: float) -> None:
 @app.route("/webhook", methods=["POST"])
 def webhook() -> Tuple[Dict[str, Any], int]:
     """
-    处理交易 webhook 请求
+    统一 webhook 入口，通过 type 区分处理逻辑
+    type=cn: A 股信号，仅记录历史和飞书通知
+    type=crypto: 币安交易信号，执行下单逻辑
     
     Returns:
         JSON 响应和 HTTP 状态码
@@ -489,6 +491,88 @@ def webhook() -> Tuple[Dict[str, Any], int]:
             logger.warning(f"Received secret: {secret[:10] if secret else 'None'}...")
             return jsonify({"error": "unauthorized"}), 403
 
+        # 识别类型（默认 crypto）
+        req_type = str(data.get("type", "crypto")).lower()
+        if req_type not in ("cn", "crypto"):
+            logger.warning(f"Invalid webhook type: {req_type}")
+            return jsonify({"error": "invalid type, must be cn or crypto"}), 400
+
+        # ================= A股逻辑 =================
+        if req_type == "cn":
+            # 验证 action（只处理 ENTRY，忽略 EXIT）
+            action = data.get("action", "ENTRY").upper()
+            if action != "ENTRY":
+                logger.info(f"Ignoring non-ENTRY action: {action}")
+                return jsonify({"status": "ignored", "reason": f"action {action} not processed"}), 200
+
+            # 验证和解析参数
+            side = data.get("side", "").upper()
+            if side != "LONG":
+                logger.warning(f"Stock webhook only supports LONG, got: {side}")
+                return jsonify({"error": "only LONG orders are supported"}), 400
+
+            # 获取交易参数
+            symbol = data.get("symbol", "")
+            try:
+                qty = float(data.get("qty", 0))
+                entry = float(data.get("entry", 0))
+                stop = float(data.get("stop", 0))
+            except (ValueError, TypeError) as e:
+                logger.warning(f"Invalid qty/entry/stop values: {e}")
+                return jsonify({"error": "invalid qty, entry or stop value"}), 400
+
+            # 验证价格参数
+            if entry <= 0 or stop <= 0 or qty <= 0:
+                logger.warning(f"Invalid values: qty={qty}, entry={entry}, stop={stop}")
+                return jsonify({"error": "qty, entry and stop must be positive"}), 400
+
+            # 获取可选参数
+            tp1 = data.get("tp1")
+            tp2 = data.get("tp2")
+            score = data.get("score")
+            
+            # 发送飞书通知
+            msg_parts = [
+                "📈 A股交易信号",
+                f"标的: {symbol}",
+                f"方向: {side}",
+                f"数量: {qty}",
+                f"入场: {entry}",
+                f"止损: {stop}"
+            ]
+            if tp1:
+                msg_parts.append(f"止盈1: {tp1}")
+            if tp2:
+                msg_parts.append(f"止盈2: {tp2}")
+            if score:
+                msg_parts.append(f"评分: {score}")
+            
+            msg = "\n".join(msg_parts)
+            logger.info(f"Stock trade signal: {msg}")
+            feishu_notify(msg)
+
+            # 保存交易历史
+            save_trade_history(
+                side=side,
+                qty=qty,
+                entry=entry,
+                stop=stop,
+                order_id=None,
+                symbol=symbol,
+                message=msg
+            )
+
+            return jsonify({
+                "status": "ok",
+                "symbol": symbol,
+                "side": side,
+                "qty": qty,
+                "entry": entry,
+                "stop": stop,
+                "message": "Trade signal recorded"
+            }), 200
+
+        # ================= 币安交易逻辑 =================
         # 验证和解析参数
         side = data.get("side", "").upper()
         if side not in ("LONG", "SHORT"):
@@ -592,130 +676,6 @@ def webhook() -> Tuple[Dict[str, Any], int]:
 
     except Exception as e:
         logger.error(f"Unexpected error in webhook: {e}", exc_info=True)
-        return jsonify({"error": "internal server error"}), 500
-
-# ================= A股 Webhook =================
-@app.route("/webhook_a_stock", methods=["POST"])
-def webhook_a_stock() -> Tuple[Dict[str, Any], int]:
-    """
-    处理 A 股交易 webhook 请求（仅做多）
-    只记录交易历史和发送飞书通知，不执行实际交易
-    
-    Returns:
-        JSON 响应和 HTTP 状态码
-    """
-    try:
-        # 尝试多种方式获取 JSON 数据
-        data = None
-        
-        # 方法1: 尝试从 JSON 请求体获取
-        data = request.get_json(force=True, silent=True)
-        
-        # 方法2: 如果失败，尝试从原始数据获取（TradingView 可能发送纯文本 JSON）
-        if not data:
-            raw_data = request.get_data(as_text=True)
-            logger.info(f"Raw stock webhook data: {raw_data[:200]}")
-            
-            if raw_data:
-                try:
-                    data = json.loads(raw_data)
-                    logger.info("Successfully parsed JSON from raw data")
-                except json.JSONDecodeError as e:
-                    logger.warning(f"Failed to parse JSON from raw data: {e}")
-                    if request.form:
-                        data = dict(request.form)
-                        logger.info("Using form data")
-        
-        # 记录请求（脱敏处理）
-        log_data = {k: v for k, v in data.items() if k != "secret"} if data else None
-        logger.info(f"Stock webhook received: {log_data}")
-
-        # 验证 JSON
-        if not data:
-            logger.warning("Invalid JSON in stock webhook request")
-            return jsonify({"error": "invalid json"}), 400
-
-        # 验证密钥（支持从 JSON 或 URL 查询参数获取）
-        secret = data.get("secret") or request.args.get("secret")
-        if secret != WEBHOOK_SECRET:
-            logger.warning("Unauthorized stock webhook request")
-            return jsonify({"error": "unauthorized"}), 403
-
-        # 验证 action（只处理 ENTRY，忽略 EXIT）
-        action = data.get("action", "ENTRY").upper()
-        if action != "ENTRY":
-            logger.info(f"Ignoring non-ENTRY action: {action}")
-            return jsonify({"status": "ignored", "reason": f"action {action} not processed"}), 200
-
-        # 验证和解析参数
-        side = data.get("side", "").upper()
-        if side != "LONG":
-            logger.warning(f"Stock webhook only supports LONG, got: {side}")
-            return jsonify({"error": "only LONG orders are supported"}), 400
-
-        # 获取交易参数
-        symbol = data.get("symbol", "")
-        try:
-            qty = float(data.get("qty", 0))
-            entry = float(data.get("entry", 0))
-            stop = float(data.get("stop", 0))
-        except (ValueError, TypeError) as e:
-            logger.warning(f"Invalid qty/entry/stop values: {e}")
-            return jsonify({"error": "invalid qty, entry or stop value"}), 400
-
-        # 验证价格参数
-        if entry <= 0 or stop <= 0 or qty <= 0:
-            logger.warning(f"Invalid values: qty={qty}, entry={entry}, stop={stop}")
-            return jsonify({"error": "qty, entry and stop must be positive"}), 400
-
-        # 获取可选参数
-        tp1 = data.get("tp1")
-        tp2 = data.get("tp2")
-        score = data.get("score")
-        
-        # 发送飞书通知
-        msg_parts = [
-            f"📈 A股交易信号",
-            f"标的: {symbol}",
-            f"方向: {side}",
-            f"数量: {qty}",
-            f"入场: {entry}",
-            f"止损: {stop}"
-        ]
-        if tp1:
-            msg_parts.append(f"止盈1: {tp1}")
-        if tp2:
-            msg_parts.append(f"止盈2: {tp2}")
-        if score:
-            msg_parts.append(f"评分: {score}")
-        
-        msg = "\n".join(msg_parts)
-        logger.info(f"Stock trade signal: {msg}")
-        feishu_notify(msg)
-
-        # 保存交易历史
-        save_trade_history(
-            side=side,
-            qty=qty,
-            entry=entry,
-            stop=stop,
-            order_id=None,
-            symbol=symbol,
-            message=msg
-        )
-
-        return jsonify({
-            "status": "ok",
-            "symbol": symbol,
-            "side": side,
-            "qty": qty,
-            "entry": entry,
-            "stop": stop,
-            "message": "Trade signal recorded"
-        }), 200
-
-    except Exception as e:
-        logger.error(f"Unexpected error in stock webhook: {e}", exc_info=True)
         return jsonify({"error": "internal server error"}), 500
 
 # ================= Health Check =================
