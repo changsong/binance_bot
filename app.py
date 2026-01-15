@@ -66,7 +66,6 @@ missing = []
 for k, v in {
     "API_KEY": API_KEY,
     "API_SECRET": API_SECRET,
-    "WEBHOOK_SECRET": WEBHOOK_SECRET,
 }.items():
     if not v:
         missing.append(k)
@@ -473,23 +472,12 @@ def webhook() -> Tuple[Dict[str, Any], int]:
                         data = dict(request.form)
                         logger.info("Using form data")
         
-        # 记录请求（脱敏处理）
-        log_data = {k: v for k, v in data.items() if k != "secret"} if data else None
-        logger.info(f"Webhook received: {log_data}")
-
         # 验证 JSON
         if not data:
             logger.warning("Invalid JSON in webhook request")
             logger.warning(f"Content-Type: {request.content_type}")
             logger.warning(f"Raw data: {request.get_data(as_text=True)[:500]}")
             return jsonify({"error": "invalid json"}), 400
-
-        # 验证密钥（支持从 JSON 或 URL 查询参数获取）
-        secret = data.get("secret") or request.args.get("secret")
-        if secret != WEBHOOK_SECRET:
-            logger.warning("Unauthorized webhook request")
-            logger.warning(f"Received secret: {secret[:10] if secret else 'None'}...")
-            return jsonify({"error": "unauthorized"}), 403
 
         # 识别类型（默认 crypto）
         req_type = str(data.get("type", "crypto")).lower()
