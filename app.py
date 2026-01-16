@@ -481,12 +481,12 @@ def webhook() -> Tuple[Dict[str, Any], int]:
 
         # 识别类型（默认 crypto）
         req_type = str(data.get("type", "crypto")).lower()
-        if req_type not in ("cn", "crypto"):
+        if req_type not in ("cn", "crypto", "us"):
             logger.warning(f"Invalid webhook type: {req_type}")
             return jsonify({"error": "invalid type, must be cn or crypto"}), 400
 
         # ================= A股逻辑 =================
-        if req_type == "cn":
+        if req_type == "cn" or req_type == "us":
             # 验证 action（只处理 ENTRY，忽略 EXIT）
             action = data.get("action", "ENTRY").upper()
             if action != "ENTRY":
@@ -521,7 +521,7 @@ def webhook() -> Tuple[Dict[str, Any], int]:
             
             # 发送飞书通知
             msg_parts = [
-                "📈 A股交易信号",
+                "📈 A股/美股交易信号",
                 f"标的: {symbol}",
                 f"方向: {side}",
                 f"数量: {qty}",
@@ -536,7 +536,7 @@ def webhook() -> Tuple[Dict[str, Any], int]:
                 msg_parts.append(f"评分: {score}")
             
             msg = "\n".join(msg_parts)
-            logger.info(f"Stock trade signal: {msg}")
+            logger.info(f"A股/美股交易信号: {msg}")
             feishu_notify(msg)
 
             # 保存交易历史
