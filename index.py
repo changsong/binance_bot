@@ -190,6 +190,18 @@ else:
             display_columns.append('stop')
             column_config['stop'] = st.column_config.NumberColumn("止损价", format="%.2f")
         
+        if 'tp1' in filtered_df.columns:
+            display_columns.append('tp1')
+            column_config['tp1'] = st.column_config.NumberColumn("止盈1", format="%.2f")
+        
+        if 'tp2' in filtered_df.columns:
+            display_columns.append('tp2')
+            column_config['tp2'] = st.column_config.NumberColumn("止盈2", format="%.2f")
+        
+        if 'score' in filtered_df.columns:
+            display_columns.append('score')
+            column_config['score'] = st.column_config.NumberColumn("评分", format="%.2f")
+        
         if 'order_id' in filtered_df.columns:
             display_columns.append('order_id')
             column_config['order_id'] = st.column_config.NumberColumn("订单ID", format="%d")

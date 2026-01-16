@@ -208,7 +208,18 @@ def feishu_notify(msg: str) -> None:
         logger.error(f"Feishu error: {e}")
 
 # ================= 交易历史记录 =================
-def save_trade_history(side: str, qty: float, entry: float, stop: float, order_id: Optional[int] = None, symbol: Optional[str] = None, message: Optional[str] = None) -> None:
+def save_trade_history(
+    side: str,
+    qty: float,
+    entry: float,
+    stop: float,
+    order_id: Optional[int] = None,
+    symbol: Optional[str] = None,
+    message: Optional[str] = None,
+    tp1: Optional[float] = None,
+    tp2: Optional[float] = None,
+    score: Optional[float] = None,
+) -> None:
     """
     保存交易记录到文件
     
@@ -220,6 +231,9 @@ def save_trade_history(side: str, qty: float, entry: float, stop: float, order_i
         order_id: 订单ID（可选）
         symbol: 交易标的（可选，默认使用 SYMBOL）
         message: 交易消息/备注（可选）
+        tp1: 止盈1（可选）
+        tp2: 止盈2（可选）
+        score: 评分（可选）
     """
     try:
         trade_record = {
@@ -236,6 +250,12 @@ def save_trade_history(side: str, qty: float, entry: float, stop: float, order_i
         # 如果提供了消息，添加到记录中
         if message:
             trade_record["message"] = message
+        if tp1 is not None:
+            trade_record["tp1"] = tp1
+        if tp2 is not None:
+            trade_record["tp2"] = tp2
+        if score is not None:
+            trade_record["score"] = score
         
         # 读取现有历史记录
         history = []
@@ -518,6 +538,18 @@ def webhook() -> Tuple[Dict[str, Any], int]:
             tp1 = data.get("tp1")
             tp2 = data.get("tp2")
             score = data.get("score")
+            try:
+                tp1_val = float(tp1) if tp1 is not None else None
+            except (ValueError, TypeError):
+                tp1_val = None
+            try:
+                tp2_val = float(tp2) if tp2 is not None else None
+            except (ValueError, TypeError):
+                tp2_val = None
+            try:
+                score_val = float(score) if score is not None else None
+            except (ValueError, TypeError):
+                score_val = None
             
             # 发送飞书通知
             msg_parts = [
@@ -528,12 +560,12 @@ def webhook() -> Tuple[Dict[str, Any], int]:
                 f"入场: {entry}",
                 f"止损: {stop}"
             ]
-            if tp1:
-                msg_parts.append(f"止盈1: {tp1}")
-            if tp2:
-                msg_parts.append(f"止盈2: {tp2}")
-            if score:
-                msg_parts.append(f"评分: {score}")
+        if tp1_val is not None:
+            msg_parts.append(f"止盈1: {tp1_val}")
+        if tp2_val is not None:
+            msg_parts.append(f"止盈2: {tp2_val}")
+        if score_val is not None:
+            msg_parts.append(f"评分: {score_val}")
             
             msg = "\n".join(msg_parts)
             logger.info(f"A股/美股交易信号: {msg}")
@@ -547,7 +579,10 @@ def webhook() -> Tuple[Dict[str, Any], int]:
                 stop=stop,
                 order_id=None,
                 symbol=symbol,
-                message=msg
+                message=msg,
+                tp1=tp1_val,
+                tp2=tp2_val,
+                score=score_val
             )
 
             return jsonify({
