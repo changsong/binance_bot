@@ -110,6 +110,39 @@ else:
     if 'timestamp' in df.columns:
         df['formatted_time'] = df['timestamp'].apply(format_timestamp)
         df = df.sort_values('timestamp', ascending=False)
+
+    # 一对二配对标记（ENTRY 对应 TP1/TP2）
+    if 'action' in df.columns and 'entry_id' in df.columns:
+        df['pair_status'] = ""
+        # 统计每个 entry_id 的退出原因
+        exits = df[df['action'] == 'EXIT'] if 'EXIT' in df['action'].values else pd.DataFrame()
+        exit_map = {}
+        if not exits.empty and 'exit_reason' in exits.columns:
+            for _, row in exits.iterrows():
+                eid = row.get('entry_id')
+                reason = row.get('exit_reason')
+                if eid:
+                    exit_map.setdefault(eid, set()).add(str(reason))
+
+        def _pair_status(row):
+            if row.get('action') == 'ENTRY':
+                eid = row.get('entry_id')
+                reasons = exit_map.get(eid, set())
+                has_tp1 = 'TP1' in reasons
+                has_tp2 = 'TP2' in reasons
+                if has_tp1 and has_tp2:
+                    return "一对二✅"
+                if has_tp1 and not has_tp2:
+                    return "TP1✅ / TP2⏳"
+                if has_tp2 and not has_tp1:
+                    return "TP1⏳ / TP2✅"
+                return "未退出"
+            if row.get('action') == 'EXIT':
+                reason = row.get('exit_reason') or "EXIT"
+                return f"{reason}"
+            return ""
+
+        df['pair_status'] = df.apply(_pair_status, axis=1)
     
     # 统计信息
     col1, col2, col3, col4 = st.columns(4)
@@ -189,6 +222,34 @@ else:
         if 'stop' in filtered_df.columns:
             display_columns.append('stop')
             column_config['stop'] = st.column_config.NumberColumn("止损价", format="%.2f")
+
+        if 'tp1' in filtered_df.columns:
+            display_columns.append('tp1')
+            column_config['tp1'] = st.column_config.NumberColumn("止盈1", format="%.2f")
+
+        if 'tp2' in filtered_df.columns:
+            display_columns.append('tp2')
+            column_config['tp2'] = st.column_config.NumberColumn("止盈2", format="%.2f")
+
+        if 'score' in filtered_df.columns:
+            display_columns.append('score')
+            column_config['score'] = st.column_config.NumberColumn("评分", format="%.2f")
+
+        if 'action' in filtered_df.columns:
+            display_columns.append('action')
+            column_config['action'] = st.column_config.TextColumn("动作", width="small")
+
+        if 'exit_reason' in filtered_df.columns:
+            display_columns.append('exit_reason')
+            column_config['exit_reason'] = st.column_config.TextColumn("退出原因", width="small")
+
+        if 'entry_id' in filtered_df.columns:
+            display_columns.append('entry_id')
+            column_config['entry_id'] = st.column_config.TextColumn("入场ID", width="medium")
+
+        if 'pair_status' in filtered_df.columns:
+            display_columns.append('pair_status')
+            column_config['pair_status'] = st.column_config.TextColumn("配对状态", width="small")
         
         if 'order_id' in filtered_df.columns:
             display_columns.append('order_id')

@@ -219,6 +219,9 @@ def save_trade_history(
     tp1: Optional[float] = None,
     tp2: Optional[float] = None,
     score: Optional[float] = None,
+    action: Optional[str] = None,
+    exit_reason: Optional[str] = None,
+    entry_id: Optional[str] = None,
 ) -> None:
     """
     保存交易记录到文件
@@ -234,6 +237,9 @@ def save_trade_history(
         tp1: 止盈1（可选）
         tp2: 止盈2（可选）
         score: 评分（可选）
+        action: ENTRY 或 EXIT（可选）
+        exit_reason: 退出原因（如 TP1/TP2）（可选）
+        entry_id: 入场记录ID（可选，用于配对）
     """
     try:
         trade_record = {
@@ -256,6 +262,12 @@ def save_trade_history(
             trade_record["tp2"] = tp2
         if score is not None:
             trade_record["score"] = score
+        if action:
+            trade_record["action"] = action
+        if exit_reason:
+            trade_record["exit_reason"] = exit_reason
+        if entry_id:
+            trade_record["entry_id"] = entry_id
         
         # 读取现有历史记录
         history = []
@@ -507,10 +519,10 @@ def webhook() -> Tuple[Dict[str, Any], int]:
 
         # ================= A股逻辑 =================
         if req_type == "cn" or req_type == "us":
-            # 验证 action（只处理 ENTRY，忽略 EXIT）
+            # 验证 action（ENTRY/EXIT）
             action = data.get("action", "ENTRY").upper()
-            if action != "ENTRY":
-                logger.info(f"Ignoring non-ENTRY action: {action}")
+            if action not in ("ENTRY", "EXIT"):
+                logger.info(f"Ignoring unsupported action: {action}")
                 return jsonify({"status": "ignored", "reason": f"action {action} not processed"}), 200
 
             # 验证和解析参数
@@ -529,11 +541,6 @@ def webhook() -> Tuple[Dict[str, Any], int]:
                 logger.warning(f"Invalid qty/entry/stop values: {e}")
                 return jsonify({"error": "invalid qty, entry or stop value"}), 400
 
-            # 验证价格参数
-            if entry <= 0 or stop <= 0 or qty <= 0:
-                logger.warning(f"Invalid values: qty={qty}, entry={entry}, stop={stop}")
-                return jsonify({"error": "qty, entry and stop must be positive"}), 400
-
             # 获取可选参数
             tp1 = data.get("tp1")
             tp2 = data.get("tp2")
@@ -550,39 +557,106 @@ def webhook() -> Tuple[Dict[str, Any], int]:
                 score_val = float(score) if score is not None else None
             except (ValueError, TypeError):
                 score_val = None
-            
-            # 发送飞书通知
-            msg_parts = [
-                "📈 A股/美股交易信号",
+
+            if action == "ENTRY":
+                # 验证价格参数
+                if entry <= 0 or stop <= 0 or qty <= 0:
+                    logger.warning(f"Invalid values: qty={qty}, entry={entry}, stop={stop}")
+                    return jsonify({"error": "qty, entry and stop must be positive"}), 400
+
+                entry_id = f"{symbol}-{int(time.time() * 1000)}"
+
+                msg_parts = [
+                    "📈 A股/美股交易信号",
+                    f"标的: {symbol}",
+                    f"方向: {side}",
+                    f"数量: {qty}",
+                    f"入场: {entry}",
+                    f"止损: {stop}"
+                ]
+                if tp1_val is not None:
+                    msg_parts.append(f"止盈1: {tp1_val}")
+                if tp2_val is not None:
+                    msg_parts.append(f"止盈2: {tp2_val}")
+                if score_val is not None:
+                    msg_parts.append(f"评分: {score_val}")
+
+                msg = "\n".join(msg_parts)
+                logger.info(f"A股/美股交易信号: {msg}")
+                feishu_notify(msg)
+
+                save_trade_history(
+                    side=side,
+                    qty=qty,
+                    entry=entry,
+                    stop=stop,
+                    order_id=None,
+                    symbol=symbol,
+                    message=msg,
+                    tp1=tp1_val,
+                    tp2=tp2_val,
+                    score=score_val,
+                    action="ENTRY",
+                    entry_id=entry_id
+                )
+
+                return jsonify({
+                    "status": "ok",
+                    "symbol": symbol,
+                    "side": side,
+                    "qty": qty,
+                    "entry": entry,
+                    "stop": stop,
+                    "message": "Trade signal recorded",
+                    "entry_id": entry_id
+                }), 200
+
+            # ================= EXIT 处理 =================
+            exit_reason = str(data.get("exit_reason", "")).upper() if data.get("exit_reason") else None
+            try:
+                entry_price = float(data.get("entry_price", entry))
+                exit_price = float(data.get("exit_price", data.get("exit", entry)))
+            except (ValueError, TypeError) as e:
+                logger.warning(f"Invalid entry/exit price values: {e}")
+                return jsonify({"error": "invalid entry_price or exit_price"}), 400
+
+            if qty <= 0 or entry_price <= 0 or exit_price <= 0:
+                logger.warning(f"Invalid exit values: qty={qty}, entry_price={entry_price}, exit_price={exit_price}")
+                return jsonify({"error": "qty, entry_price and exit_price must be positive"}), 400
+
+            # 找到最近的 ENTRY 记录
+            entry_id = None
+            history = get_trade_history(limit=0)
+            for record in reversed(history):
+                if record.get("symbol") == symbol and record.get("side") == "LONG" and record.get("action") == "ENTRY":
+                    entry_id = record.get("entry_id") or f"{symbol}-{record.get('timestamp')}"
+                    break
+            if not entry_id:
+                entry_id = f"{symbol}-{int(time.time() * 1000)}"
+
+            msg = "\n".join([
+                "📉 A股/美股退出信号",
                 f"标的: {symbol}",
                 f"方向: {side}",
                 f"数量: {qty}",
-                f"入场: {entry}",
-                f"止损: {stop}"
-            ]
-        if tp1_val is not None:
-            msg_parts.append(f"止盈1: {tp1_val}")
-        if tp2_val is not None:
-            msg_parts.append(f"止盈2: {tp2_val}")
-        if score_val is not None:
-            msg_parts.append(f"评分: {score_val}")
-            
-            msg = "\n".join(msg_parts)
-            logger.info(f"A股/美股交易信号: {msg}")
+                f"入场: {entry_price}",
+                f"退出: {exit_price}",
+                f"原因: {exit_reason or 'UNKNOWN'}"
+            ])
+            logger.info(f"A股/美股退出信号: {msg}")
             feishu_notify(msg)
 
-            # 保存交易历史
             save_trade_history(
                 side=side,
                 qty=qty,
-                entry=entry,
-                stop=stop,
+                entry=entry_price,
+                stop=0.0,
                 order_id=None,
                 symbol=symbol,
                 message=msg,
-                tp1=tp1_val,
-                tp2=tp2_val,
-                score=score_val
+                action="EXIT",
+                exit_reason=exit_reason,
+                entry_id=entry_id
             )
 
             return jsonify({
@@ -590,9 +664,10 @@ def webhook() -> Tuple[Dict[str, Any], int]:
                 "symbol": symbol,
                 "side": side,
                 "qty": qty,
-                "entry": entry,
-                "stop": stop,
-                "message": "Trade signal recorded"
+                "entry_price": entry_price,
+                "exit_price": exit_price,
+                "exit_reason": exit_reason,
+                "entry_id": entry_id
             }), 200
 
         # ================= 币安交易逻辑 =================
