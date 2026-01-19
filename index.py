@@ -251,10 +251,6 @@ else:
             display_columns.append('pair_status')
             column_config['pair_status'] = st.column_config.TextColumn("配对状态", width="small")
         
-        if 'order_id' in filtered_df.columns:
-            display_columns.append('order_id')
-            column_config['order_id'] = st.column_config.NumberColumn("订单ID", format="%d")
-        
         if 'message' in filtered_df.columns:
             display_columns.append('message')
             column_config['message'] = st.column_config.TextColumn("消息", width="large")
