@@ -82,7 +82,7 @@ with st.sidebar:
     st.markdown("---")
     st.header("🔄 刷新设置")
     auto_refresh = st.checkbox("自动刷新", value=True)
-    refresh_interval = st.slider("刷新间隔（秒）", 10, 300, 60, 10)
+    refresh_interval = st.slider("刷新间隔（秒）", 10, 300, 10, 10)
     
     st.markdown("---")
     if st.button("🔄 手动刷新", use_container_width=True):
