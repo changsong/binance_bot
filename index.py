@@ -7,6 +7,7 @@ import json
 import time
 import streamlit as st
 import pandas as pd
+from typing import Optional
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -22,6 +23,8 @@ st.set_page_config(
 
 # 交易历史文件路径
 TRADE_HISTORY_FILE = "./logs/trade_history.json"
+# 回测结果文件路径
+BACKTEST_HISTORY_FILE = "./logs/backtest_history.json"
 
 # 从环境变量读取配置
 BINANCE_MODE = os.getenv("BINANCE_MODE", "testnet").lower()
@@ -41,6 +44,19 @@ def load_trade_history() -> list:
         return history if isinstance(history, list) else []
     except Exception as e:
         st.error(f"加载交易历史失败: {e}")
+        return []
+
+@st.cache_data(ttl=60)
+def load_backtest_history() -> list:
+    """加载回测批次数据"""
+    try:
+        if not os.path.exists(BACKTEST_HISTORY_FILE):
+            return []
+        with open(BACKTEST_HISTORY_FILE, "r", encoding="utf-8") as f:
+            history = json.load(f)
+        return history if isinstance(history, list) else []
+    except Exception as e:
+        st.error(f"加载回测数据失败: {e}")
         return []
 
 def format_timestamp(timestamp: str) -> str:
@@ -67,6 +83,19 @@ def get_side_color(side: str) -> str:
     elif side == "SHORT":
         return "🔴"
     return "⚪"
+
+def parse_numeric(value) -> Optional[float]:
+    """解析带符号/百分号的数字字符串"""
+    if value is None:
+        return None
+    try:
+        s = str(value).strip()
+        if not s:
+            return None
+        s = s.replace("%", "").replace("+", "").replace("−", "-")
+        return float(s)
+    except Exception:
+        return None
 
 # ================= 主界面 =================
 st.title("📊 交易历史")
@@ -291,6 +320,90 @@ else:
             ⏱️ 页面将在 {refresh_interval} 秒后自动刷新...
         </div>
         """, unsafe_allow_html=True)
+
+# ================= 回测批次展示 =================
+st.markdown("---")
+st.header("📈 回测批次")
+
+backtests = load_backtest_history()
+if not backtests:
+    st.info("暂无回测批次数据")
+else:
+    bt_df = pd.DataFrame(backtests)
+
+    batch_ids = []
+    if "batchId" in bt_df.columns:
+        batch_ids = sorted(bt_df["batchId"].dropna().unique().tolist())
+
+    if batch_ids:
+        selected_batch = st.selectbox("选择回测批次", batch_ids, index=len(batch_ids) - 1)
+        batch_df = bt_df[bt_df["batchId"] == selected_batch].copy()
+    else:
+        selected_batch = None
+        batch_df = bt_df.copy()
+
+    # 解析数值字段
+    metric_cols = [
+        "totalPnL",
+        "maxEquityDrawdown",
+        "totalTrades",
+        "winningTradesPercent",
+        "profitFactor",
+        "sharpeRatio"
+    ]
+    for col in metric_cols:
+        if col in batch_df.columns:
+            batch_df[col] = batch_df[col].apply(parse_numeric)
+
+    st.dataframe(batch_df, use_container_width=True, hide_index=True, height=400)
+
+    # 批次对比
+    if len(batch_ids) >= 2:
+        st.subheader("📊 批次对比")
+        default_a = batch_ids[-1]
+        default_b = batch_ids[-2]
+        col1, col2 = st.columns(2)
+        with col1:
+            batch_a = st.selectbox("批次 A", batch_ids, index=len(batch_ids) - 1, key="batch_a")
+        with col2:
+            batch_b = st.selectbox("批次 B", batch_ids, index=len(batch_ids) - 2, key="batch_b")
+
+        df_a = bt_df[bt_df["batchId"] == batch_a].copy()
+        df_b = bt_df[bt_df["batchId"] == batch_b].copy()
+        for col in metric_cols:
+            if col in df_a.columns:
+                df_a[col] = df_a[col].apply(parse_numeric)
+            if col in df_b.columns:
+                df_b[col] = df_b[col].apply(parse_numeric)
+
+        if "symbol" in df_a.columns and "symbol" in df_b.columns:
+            common_symbols = sorted(set(df_a["symbol"]) & set(df_b["symbol"]))
+        else:
+            common_symbols = []
+
+        if not common_symbols:
+            st.warning("两个批次没有相同的标的可对比")
+        else:
+            compare_rows = []
+            for sym in common_symbols:
+                row_a = df_a[df_a["symbol"] == sym].iloc[-1].to_dict()
+                row_b = df_b[df_b["symbol"] == sym].iloc[-1].to_dict()
+                row = {"symbol": sym}
+                for col in metric_cols:
+                    a_val = row_a.get(col)
+                    b_val = row_b.get(col)
+                    row[f"{col}_A"] = a_val
+                    row[f"{col}_B"] = b_val
+                    if a_val is not None and b_val is not None:
+                        row[f"{col}_diff"] = b_val - a_val
+                compare_rows.append(row)
+
+            compare_df = pd.DataFrame(compare_rows)
+            st.dataframe(compare_df, use_container_width=True, hide_index=True, height=400)
+
+            chart_metric = st.selectbox("对比指标（折线图）", metric_cols)
+            chart_df = compare_df.set_index("symbol")[[f"{chart_metric}_A", f"{chart_metric}_B"]]
+            st.line_chart(chart_df)
 
 # 页脚
 st.markdown("---")

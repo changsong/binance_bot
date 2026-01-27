@@ -50,6 +50,8 @@ SKIP_LEVERAGE_SETUP = os.getenv("SKIP_LEVERAGE_SETUP", "false").lower() == "true
 
 # ========== 交易历史文件 ==========
 TRADE_HISTORY_FILE = "./logs/trade_history.json"
+# ========== 回测结果文件 ==========
+BACKTEST_HISTORY_FILE = "./logs/backtest_history.json"
 
 # ========== Security ==========
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
@@ -774,6 +776,55 @@ def webhook() -> Tuple[Dict[str, Any], int]:
 
     except Exception as e:
         logger.error(f"Unexpected error in webhook: {e}", exc_info=True)
+        return jsonify({"error": "internal server error"}), 500
+
+# ================= Backtest =================
+@app.route("/backtest", methods=["POST"])
+def backtest() -> Tuple[Dict[str, Any], int]:
+    """
+    接收回测结果批量数据并存储
+    请求体应为 JSON 数组
+    """
+    try:
+        data = request.get_json(force=True, silent=True)
+        if not isinstance(data, list):
+            return jsonify({"error": "invalid json, expected list"}), 400
+
+        batch_id = datetime.now().strftime("%Y%m%d%H%M%S")
+        created_at = datetime.now().isoformat()
+
+        records = []
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            symbol = item.get("symbol")
+            if not symbol:
+                continue
+            record = dict(item)
+            record["batchId"] = batch_id
+            record["createdAt"] = created_at
+            records.append(record)
+
+        if not records:
+            return jsonify({"error": "no valid records"}), 400
+
+        history = []
+        if os.path.exists(BACKTEST_HISTORY_FILE):
+            try:
+                with open(BACKTEST_HISTORY_FILE, "r", encoding="utf-8") as f:
+                    history = json.load(f)
+            except Exception:
+                history = []
+
+        history.extend(records)
+        os.makedirs(os.path.dirname(BACKTEST_HISTORY_FILE), exist_ok=True)
+        with open(BACKTEST_HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(history, f, indent=2, ensure_ascii=False)
+
+        logger.info(f"Backtest batch saved: batchId={batch_id}, count={len(records)}")
+        return jsonify({"status": "ok", "batchId": batch_id, "count": len(records)}), 200
+    except Exception as e:
+        logger.error(f"Failed to save backtest data: {e}", exc_info=True)
         return jsonify({"error": "internal server error"}), 500
 
 # ================= Health Check =================
