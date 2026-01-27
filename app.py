@@ -6,7 +6,7 @@ import requests
 from datetime import datetime
 from typing import Dict, Optional, Tuple, Any, Union
 from logging.handlers import RotatingFileHandler
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, make_response
 from binance.um_futures import UMFutures
 from binance.client import Client
 from binance.error import ClientError, ServerError
@@ -111,6 +111,27 @@ logger.addHandler(console_handler)
 
 # ================= Flask =================
 app = Flask(__name__)
+
+# ================= CORS =================
+ALLOWED_ORIGINS = {"https://cn.tradingview.com"}
+
+
+@app.after_request
+def add_cors_headers(response):
+    origin = request.headers.get("Origin")
+    if origin in ALLOWED_ORIGINS:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type"
+        response.headers["Access-Control-Max-Age"] = "600"
+    return response
+
+
+@app.route("/backtest", methods=["OPTIONS"])
+def backtest_options():
+    # 处理预检请求
+    response = make_response("", 204)
+    return response
 
 # ================= Binance 客户端初始化 =================
 if TRADE_TYPE == "futures":
