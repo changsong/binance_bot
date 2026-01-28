@@ -377,6 +377,13 @@ else:
             if col in batch_df.columns:
                 batch_df[col] = batch_df[col].apply(parse_numeric)
 
+        # 按标的筛选
+        if "symbol" in batch_df.columns:
+            symbols = ["全部"] + sorted(batch_df["symbol"].dropna().unique().tolist())
+            selected_symbol = st.selectbox("按标的筛选", symbols, index=0, key="bt_symbol_filter")
+            if selected_symbol != "全部":
+                batch_df = batch_df[batch_df["symbol"] == selected_symbol]
+
         st.dataframe(batch_df, use_container_width=True, hide_index=True, height=400)
 
         # 批次对比
