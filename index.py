@@ -1,6 +1,6 @@
 """
 交易历史展示页面 - 使用 Streamlit
-运行方式: streamlit run streamlit_history.py
+运行方式: streamlit run index.py
 """
 import os
 import json
@@ -21,10 +21,11 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # 交易历史文件路径
-TRADE_HISTORY_FILE = "./logs/trade_history.json"
+TRADE_HISTORY_FILE = os.path.join(BASE_DIR, "logs", "trade_history.json")
 # 回测结果文件路径
-BACKTEST_HISTORY_FILE = "./logs/backtest_history.json"
+BACKTEST_HISTORY_FILE = os.path.join(BASE_DIR, "logs", "backtest_history.json")
 
 # 从环境变量读取配置
 BINANCE_MODE = os.getenv("BINANCE_MODE", "testnet").lower()
