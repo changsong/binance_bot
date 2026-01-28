@@ -111,7 +111,6 @@ logger.addHandler(console_handler)
 
 # ================= Flask =================
 app = Flask(__name__)
-app.url_map.strict_slashes = False
 
 # ================= CORS =================
 ALLOWED_ORIGINS = {"https://cn.tradingview.com"}
@@ -119,6 +118,9 @@ ALLOWED_ORIGINS = {"https://cn.tradingview.com"}
 
 @app.after_request
 def add_cors_headers(response):
+    # /backtest 的 CORS 由 Nginx 统一处理，避免重复 header
+    if request.path.startswith("/backtest"):
+        return response
     origin = request.headers.get("Origin")
     if origin in ALLOWED_ORIGINS:
         response.headers["Access-Control-Allow-Origin"] = origin
@@ -129,7 +131,6 @@ def add_cors_headers(response):
 
 
 @app.route("/backtest", methods=["OPTIONS"])
-@app.route("/backtest/", methods=["OPTIONS"])
 def backtest_options():
     # 处理预检请求
     response = make_response("", 204)
@@ -803,7 +804,6 @@ def webhook() -> Tuple[Dict[str, Any], int]:
 
 # ================= Backtest =================
 @app.route("/backtest", methods=["POST"])
-@app.route("/backtest/", methods=["POST"])
 def backtest() -> Tuple[Dict[str, Any], int]:
     """
     接收回测结果批量数据并存储
