@@ -416,8 +416,13 @@ else:
             if not common_symbols:
                 st.warning("两个批次没有相同的标的可对比")
             else:
+                # 按标的筛选
+                symbol_options = ["全部"] + common_symbols
+                selected_symbol = st.selectbox("按标的筛选", symbol_options, index=0)
+                symbols_to_compare = common_symbols if selected_symbol == "全部" else [selected_symbol]
+
                 compare_rows = []
-                for sym in common_symbols:
+                for sym in symbols_to_compare:
                     row_a = df_a[df_a["symbol"] == sym].iloc[-1].to_dict()
                     row_b = df_b[df_b["symbol"] == sym].iloc[-1].to_dict()
                     row = {"symbol": sym}
