@@ -129,9 +129,10 @@ with st.sidebar:
 # 加载数据
 history = load_trade_history()
 
-tab1, tab2 = st.tabs(["📈 实时交易历史", "📊 回测结果分析"])
+# 页面切换（避免 tab 切换导致自动刷新回到默认页）
+page = st.radio("页面", ["实时交易历史", "回测结果分析"], horizontal=True, key="page")
 
-with tab1:
+if page == "实时交易历史":
     st.header("实时交易历史")
     if not history:
         st.warning("⚠️ 暂无交易记录")
@@ -326,7 +327,7 @@ with tab1:
         </div>
         """, unsafe_allow_html=True)
 
-with tab2:
+else:
     st.header("回测结果分析")
 
     backtests = load_backtest_history()
