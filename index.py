@@ -339,8 +339,25 @@ with tab2:
         if "batchId" in bt_df.columns:
             batch_ids = sorted(bt_df["batchId"].dropna().unique().tolist())
 
+        # 构造批次显示名称：batch_id + strategyName
+        strategy_map = {}
+        if batch_ids and "strategyName" in bt_df.columns:
+            for batch_id, group in bt_df.groupby("batchId"):
+                names = group["strategyName"].dropna().unique().tolist()
+                if names:
+                    strategy_map[batch_id] = names[0]
+
+        def _batch_label(batch_id: str) -> str:
+            name = strategy_map.get(batch_id)
+            return f"{batch_id} | {name}" if name else batch_id
+
         if batch_ids:
-            selected_batch = st.selectbox("选择回测批次", batch_ids, index=len(batch_ids) - 1)
+            selected_batch = st.selectbox(
+                "选择回测批次",
+                batch_ids,
+                index=len(batch_ids) - 1,
+                format_func=_batch_label
+            )
             batch_df = bt_df[bt_df["batchId"] == selected_batch].copy()
         else:
             selected_batch = None
@@ -366,9 +383,21 @@ with tab2:
             st.subheader("📊 批次对比")
             col1, col2 = st.columns(2)
             with col1:
-                batch_a = st.selectbox("批次 A", batch_ids, index=len(batch_ids) - 1, key="batch_a")
+                batch_a = st.selectbox(
+                    "批次 A",
+                    batch_ids,
+                    index=len(batch_ids) - 1,
+                    key="batch_a",
+                    format_func=_batch_label
+                )
             with col2:
-                batch_b = st.selectbox("批次 B", batch_ids, index=len(batch_ids) - 2, key="batch_b")
+                batch_b = st.selectbox(
+                    "批次 B",
+                    batch_ids,
+                    index=len(batch_ids) - 2,
+                    key="batch_b",
+                    format_func=_batch_label
+                )
 
             df_a = bt_df[bt_df["batchId"] == batch_a].copy()
             df_b = bt_df[bt_df["batchId"] == batch_b].copy()

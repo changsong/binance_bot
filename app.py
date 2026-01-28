@@ -814,8 +814,12 @@ def backtest() -> Tuple[Dict[str, Any], int]:
         if not isinstance(data, list):
             return jsonify({"error": "invalid json, expected list"}), 400
 
-        batch_id = datetime.now().strftime("%Y%m%d%H%M%S")
-        created_at = datetime.now().isoformat()
+        # batch_id 格式: "{market} YYYYMMDD-HHMMSS"
+        market = "UNKNOWN"
+        if data and isinstance(data[0], dict):
+            market = str(data[0].get("market") or "UNKNOWN")
+        batch_id = f"{market} {datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        created_at = datetime.now().strftime('%Y%m%d-%H%M%S')
 
         records = []
         for item in data:
